@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #fff;
+        --text: #1c1c1e;
+        --muted: #6e6e73;
+        --line: #e3e3e0;
+        --accent: #b7410e;
+        --accent-text: #fff;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #2a2a2d;
+          --text: #f2f2f2;
+          --muted: #a0a0a6;
+          --line: #46464a;
+          --accent: #e8703a;
+          --accent-text: #1c1c1e;
+        }
+      }
+      html,
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font: 13px/1.4 -apple-system, BlinkMacSystemFont, sans-serif;
+      }
+      #box {
+        padding: 12px 14px;
+      }
+      h1 {
+        margin: 0 0 4px;
+        font-size: 14px;
+      }
+      h1 span {
+        color: var(--accent);
+      }
+      p {
+        margin: 4px 0 8px;
+      }
+      .muted {
+        color: var(--muted);
+        font-size: 11px;
+      }
+      label {
+        display: flex;
+        gap: 8px;
+        align-items: baseline;
+        padding: 5px 0;
+        border-top: 1px solid var(--line);
+        cursor: pointer;
+      }
+      .btns {
+        display: flex;
+        gap: 6px;
+        margin-top: 10px;
+        flex-wrap: wrap;
+      }
+      button {
+        font: inherit;
+        color: inherit;
+        padding: 6px 10px;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: transparent;
+        cursor: pointer;
+      }
+      button.primary {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: var(--accent-text);
+        font-weight: 600;
+      }
+      .error {
+        color: #d0463a;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="box"></div>
+    <script src="passkey.js"></script>
+  </body>
+</html>

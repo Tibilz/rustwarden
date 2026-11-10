@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #fff;
+        --text: #1c1c1e;
+        --muted: #6e6e73;
+        --hover: #efefec;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #2a2a2d;
+          --text: #f2f2f2;
+          --muted: #a0a0a6;
+          --hover: #3a3a3e;
+        }
+      }
+      html,
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font: 13px/1.35 -apple-system, BlinkMacSystemFont, sans-serif;
+      }
+      .row {
+        padding: 6px 10px;
+        cursor: pointer;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+      }
+      .row:hover {
+        background: var(--hover);
+      }
+      .sub,
+      .info {
+        color: var(--muted);
+        font-size: 11px;
+      }
+      .info {
+        padding: 10px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="list"></div>
+    <script src="inline.js"></script>
+  </body>
+</html>
