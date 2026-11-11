@@ -100,6 +100,7 @@ the extension can reach it too.
 
 ```sh
 cd core && cargo test --release
+node tests/popup-render.test.js   # popup rendering and TOTP auto-copy, no browser needed
 ```
 
 The end-to-end test needs a **throwaway** Vaultwarden with open registration. It creates two

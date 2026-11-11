@@ -10,8 +10,9 @@
   --danger: #c0392b;
   color-scheme: light dark;
 }
+/* Dunkel: per System (außer explizit „Hell“) oder explizit „Dunkel“ */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme='light']) {
     --bg: #1c1c1e;
     --card: #2a2a2d;
     --text: #f2f2f2;
@@ -22,6 +23,21 @@
     --hover: #333337;
     --danger: #ff6b5e;
   }
+}
+:root[data-theme='dark'] {
+    --bg: #1c1c1e;
+  --card: #2a2a2d;
+  --text: #f2f2f2;
+  --muted: #a0a0a6;
+  --line: #3a3a3e;
+  --accent: #e8703a;
+  --accent-text: #1c1c1e;
+  --hover: #333337;
+  --danger: #ff6b5e;
+  color-scheme: dark;
+}
+:root[data-theme='light'] {
+  color-scheme: light;
 }
 * {
   box-sizing: border-box;
@@ -130,12 +146,30 @@ button.danger {
   color: var(--danger);
 }
 button.icon {
-  padding: 4px 7px;
+  display: inline-grid;
+  place-items: center;
+  min-width: 32px;
+  height: 32px;
+  padding: 0 6px;
   border-color: transparent;
   background: none;
-  border-radius: 6px;
-  font-size: 14px;
+  border-radius: 7px;
+  font-size: 17px;
   line-height: 1;
+}
+button.icon svg {
+  width: 20px;
+  height: 20px;
+  display: block;
+}
+header button.icon {
+  min-width: 34px;
+  height: 34px;
+}
+button.icon.small-icon {
+  min-width: 26px;
+  height: 26px;
+  font-size: 13px;
 }
 button.icon:hover {
   background: var(--hover);
@@ -408,4 +442,44 @@ body.tab {
 }
 body.tab #app {
   max-height: none;
+}
+
+/* Einstellungen */
+h2.group {
+  margin: 20px 0 2px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+  font-weight: 700;
+}
+main > h2.group:first-of-type {
+  margin-top: 14px;
+}
+.hint {
+  margin: 0 0 6px 22px;
+}
+select + .hint,
+div + .hint {
+  margin-left: 0;
+  margin-top: 4px;
+}
+
+.more {
+  display: flex;
+  justify-content: space-between;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--card);
+  font-size: 12px;
+}
+.link.muted {
+  color: var(--muted);
+}
+.hint-row {
+  margin: 0 0 8px 22px;
+  justify-content: space-between;
+}
+.hint-row button {
+  padding: 3px 9px;
+  font-size: 12px;
 }

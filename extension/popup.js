@@ -48,6 +48,7 @@ let filter = 'all';
 let folderFilter = '';
 let timer = null;
 const verified = new Set();
+let showOthers = false; // weitere passende Logins trotz gemerktem Login aufgeklappt
 
 // Safari schließt das Popup, sobald ein Dateidialog aufgeht – Dateiaktionen laufen deshalb in einem Tab.
 const inTab = location.hash.startsWith('#tab');
@@ -95,6 +96,41 @@ async function sha256Hex(text) {
 
 // ---------- Basis ----------
 
+// Einheitliche Strich-Icons (24er Raster) statt Unicode-Zeichen, die je nach Schrift winzig ausfallen.
+const ICONS = {
+  back: 'M15 18l-6-6 6-6',
+  sync: 'M21 12a9 9 0 1 1-2.64-6.36L21 8M21 3v5h-5',
+  plus: 'M12 5v14M5 12h14',
+  dice: 'M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zM8.5 8.5h.01M15.5 8.5h.01M12 12h.01M8.5 15.5h.01M15.5 15.5h.01',
+  send: 'M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z',
+  gear: 'M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6',
+  external: 'M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3',
+  user: 'M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z',
+  key: 'M21 2l-2 2m-7.6 7.6a5.5 5.5 0 1 1-7.78 7.78 5.5 5.5 0 0 1 7.78-7.78zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4',
+  clock: 'M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 6v6l4 2',
+  chevron: 'M9 18l6-6-6-6',
+  eye: 'M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8zM12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z',
+  copy: 'M9 9h11a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2V9zM5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1',
+  download: 'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3',
+  x: 'M18 6L6 18M6 6l12 12',
+};
+function icon(name) {
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  for (const [k, v] of Object.entries({ viewBox: '0 0 24 24', width: 20, height: 20, fill: 'none', stroke: 'currentColor',
+    'stroke-width': 2, 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true' })) svg.setAttribute(k, v);
+  const path = document.createElementNS(NS, 'path');
+  path.setAttribute('d', ICONS[name]);
+  svg.append(path);
+  return svg;
+}
+const iconBtn = (name, title, onclick) => el('button', { class: 'icon', title, 'aria-label': title, onclick }, icon(name));
+
+function applyTheme(theme) {
+  if (theme === 'light' || theme === 'dark') document.documentElement.setAttribute('data-theme', theme);
+  else document.documentElement.removeAttribute('data-theme');
+}
+
 function el(tag, props, ...kids) {
   const e = document.createElement(tag);
   let value;
@@ -126,7 +162,8 @@ function toast(msg) {
 function render(...nodes) {
   clearInterval(timer);
   timer = null;
-  app.replaceChildren(...nodes.flat());
+  // Wie in el(): bedingte Teile (`x && el(...)`) liefern null/false und dürfen nicht als Text erscheinen.
+  app.replaceChildren(...nodes.flat(Infinity).filter((n) => n != null && n !== false));
 }
 
 // Safari verlangt Clipboard-Zugriff im Klick-Kontext – daher ClipboardItem mit Promise.
@@ -159,7 +196,7 @@ function header(title, { back, actions } = {}) {
   return el(
     'header',
     {},
-    back && el('button', { class: 'icon', title: 'Zurück', onclick: back }, '‹'),
+    back && iconBtn('back', 'Zurück', back),
     el('h1', {}, title),
     actions,
   );
@@ -429,6 +466,7 @@ function viewLocked(st) {
 
 async function loadList() {
   data = await send('list', { url: tab && tab.url });
+  showOthers = false;
 }
 
 async function viewMain(reload = true) {
@@ -474,24 +512,20 @@ async function viewMain(reload = true) {
       'header',
       {},
       search,
-      el(
-        'button',
-        {
-          class: 'icon',
-          title: 'Mit Server abgleichen',
-          onclick: busy(null, async () => {
-            toast('Synchronisiere …');
-            await send('sync');
-            await viewMain();
-            toast('Tresor ist aktuell');
-          }),
-        },
-        '⟳',
+      iconBtn(
+        'sync',
+        'Mit Server abgleichen',
+        busy(null, async () => {
+          toast('Synchronisiere …');
+          await send('sync');
+          await viewMain();
+          toast('Tresor ist aktuell');
+        }),
       ),
-      el('button', { class: 'icon', title: 'Neuer Eintrag', onclick: () => viewNew() }, '+'),
-      el('button', { class: 'icon', title: 'Generator', onclick: () => viewGenerator() }, '⚄'),
-      el('button', { class: 'icon', title: 'Send', onclick: () => viewSends() }, '➤'),
-      el('button', { class: 'icon', title: 'Einstellungen', onclick: () => viewSettings() }, '⚙'),
+      iconBtn('plus', 'Neuer Eintrag', () => viewNew()),
+      iconBtn('dice', 'Generator', () => viewGenerator()),
+      iconBtn('send', 'Send', () => viewSends()),
+      iconBtn('gear', 'Einstellungen', () => viewSettings()),
     ),
     p &&
       el(
@@ -504,7 +538,8 @@ async function viewMain(reload = true) {
           p.username && el('div', { class: 'muted small' }, p.username),
         ),
         el('button', { class: 'primary', onclick: busy(null, async () => (await send('pendingAccept'), toast('Gespeichert'), viewMain())) }, 'Speichern'),
-        el('button', { onclick: busy(null, async () => (await send('pendingDismiss'), viewMain())) }, '✕'),
+        el('button', { title: 'Für diese Seite nie anbieten', onclick: busy(null, async () => (await send('neverDomain'), toast(`${p.host} ausgeschlossen`), viewMain())) }, 'Nie'),
+        el('button', { title: 'Jetzt nicht', onclick: busy(null, async () => (await send('pendingDismiss'), viewMain())) }, '✕'),
       ),
     el(
       'div',
@@ -544,11 +579,43 @@ function drawList(root) {
   if (plain && tab && /^https?:/.test(tab.url || '')) {
     const byId = new Map(data.items.map((i) => [i.id, i]));
     const m = data.matchIds.map((id) => byId.get(id)).filter(Boolean);
+    const others = (data.otherMatchIds || []).map((id) => byId.get(id)).filter(Boolean);
     nodes.push(el('div', { class: 'section' }, `Diese Seite (${m.length})`));
     if (m.length) m.forEach((it) => nodes.push(row(it, true)));
     else nodes.push(el('div', { class: 'empty' }, 'Keine passenden Logins für diese Seite.'));
-    if (!m.length) {
-      // nichts weiter
+    if (others.length) {
+      if (showOthers) others.forEach((it) => nodes.push(row(it, true)));
+      nodes.push(
+        el(
+          'div',
+          { class: 'more' },
+          el(
+            'button',
+            { class: 'link', onclick: () => ((showOthers = !showOthers), drawList(root)) },
+            showOthers ? 'Weitere ausblenden' : `${others.length} weitere ${others.length === 1 ? 'passt' : 'passen'} ebenfalls`,
+          ),
+          el(
+            'button',
+            {
+              class: 'link muted',
+              title: 'Für diese Adresse wieder alle passenden Logins vorschlagen',
+              onclick: busy(null, async () => {
+                await send('forgetHost', { url: tab.url });
+                toast('Zuordnung vergessen');
+                await viewMain();
+              }),
+            },
+            'Zuordnung vergessen',
+          ),
+        ),
+      );
+    }
+    const st = data.settings || {};
+    for (const [on, type, label] of [[st.showCards, 3, 'Karten'], [st.showIdentities, 4, 'Identitäten']]) {
+      const list = on ? data.items.filter((i) => i.type === type && !i.deleted) : [];
+      if (!list.length) continue;
+      nodes.push(el('div', { class: 'section' }, `${label} (${list.length})`));
+      list.forEach((it) => nodes.push(row(it, true)));
     }
     nodes.push(el('div', { class: 'section' }, `Alle Einträge (${items.length})`));
   }
@@ -574,7 +641,7 @@ function row(it, isMatch) {
       label,
     );
   const getField = (pick) => send('get', { id: it.id }).then((r) => pick(r.item));
-  const quick = !it.reprompt && !it.deleted && it.type === 1;
+  const quick = (data && data.settings ? data.settings.quickCopy !== false : true) && !it.reprompt && !it.deleted && it.type === 1;
   return el(
     'div',
     {
@@ -592,10 +659,10 @@ function row(it, isMatch) {
     el(
       'div',
       { class: 'acts' },
-      quick && it.user && act('@', 'Benutzername kopieren', () => copy(getField((v) => v.login.username), 'Benutzername')),
-      quick && it.pass && act('✱', 'Passwort kopieren', () => copy(getField((v) => v.login.password), 'Passwort')),
-      quick && it.totp && act('◷', 'TOTP-Code kopieren', () => copy(send('totp', { id: it.id }).then((r) => r.totp.code), 'Code')),
-      isMatch && act('›', 'Details', () => viewItem(it.id)),
+      quick && it.user && act(icon('user'), 'Benutzername kopieren', () => copy(getField((v) => v.login.username), 'Benutzername')),
+      quick && it.pass && act(icon('key'), 'Passwort kopieren', () => copy(getField((v) => v.login.password), 'Passwort')),
+      quick && it.totp && act(icon('clock'), 'TOTP-Code kopieren', () => copy(send('totp', { id: it.id }).then((r) => r.totp.code), 'Code')),
+      isMatch && act(icon('chevron'), 'Details', () => viewItem(it.id)),
     ),
   );
 }
@@ -606,7 +673,8 @@ async function doFill(it) {
     if (!tab) throw new Error('Kein aktiver Tab');
     const r = await send('fill', { id: it.id, tabId: tab.id });
     if (!r.filled) return toast('Keine passenden Felder gefunden');
-    if (r.totp) await copy(r.totp, 'Ausgefüllt – TOTP-Code');
+    const autoCopy = !data || !data.settings || data.settings.autoCopyTotp !== false;
+    if (r.totp && autoCopy) await copy(r.totp, 'Ausgefüllt – TOTP-Code');
     window.close();
   } catch (e) {
     toast(e.message);
@@ -625,9 +693,9 @@ function fieldRow(label, value, { secret, mono, copyLabel, link } = {}) {
     'div',
     { class: 'field' },
     el('div', { class: 'body' }, el('div', { class: 'k' }, label), v),
-    secret && el('button', { class: 'icon', title: 'Anzeigen/Verbergen', onclick: () => ((shown = !shown), draw()) }, '◉'),
-    link && el('button', { class: 'icon', title: 'Öffnen', onclick: () => browser.tabs.create({ url: link }) }, '↗'),
-    el('button', { class: 'icon', title: 'Kopieren', onclick: () => copy(value, copyLabel || label) }, '⧉'),
+    secret && el('button', { class: 'icon', title: 'Anzeigen/Verbergen', onclick: () => ((shown = !shown), draw()) }, icon('eye')),
+    link && el('button', { class: 'icon', title: 'Öffnen', onclick: () => browser.tabs.create({ url: link }) }, icon('external')),
+    el('button', { class: 'icon', title: 'Kopieren', onclick: () => copy(value, copyLabel || label) }, icon('copy')),
   );
 }
 
@@ -681,7 +749,7 @@ async function viewItem(id) {
           { class: 'field' },
           el('div', { class: 'body' }, el('div', { class: 'k' }, 'Einmalcode (TOTP)'), code),
           left,
-          el('button', { class: 'icon', title: 'Kopieren', onclick: () => cur && copy(cur.code, 'Code') }, '⧉'),
+          el('button', { class: 'icon', title: 'Kopieren', onclick: () => cur && copy(cur.code, 'Code') }, icon('copy')),
         ),
       );
       tick();
@@ -723,7 +791,7 @@ async function viewItem(id) {
               download(r.name, b64Bytes(r.b64));
             }),
           },
-          '↓',
+          icon('download'),
         ),
         canEdit &&
           el(
@@ -738,7 +806,7 @@ async function viewItem(id) {
                 await viewItem(id);
               }),
             },
-            '✕',
+            icon('x'),
           ),
       ),
     ),
@@ -840,7 +908,7 @@ function viewEdit(orig) {
     inputs.push(() => (obj[key] = inp.value === '' ? null : inp.value));
     const extra = [];
     if (opts.secret) {
-      extra.push(el('button', { type: 'button', class: 'icon', title: 'Anzeigen', onclick: () => (inp.type = inp.type === 'password' ? 'text' : 'password') }, '◉'));
+      extra.push(el('button', { type: 'button', class: 'icon', title: 'Anzeigen', onclick: () => (inp.type = inp.type === 'password' ? 'text' : 'password') }, icon('eye')));
     }
     if (opts.generate) {
       extra.push(
@@ -856,7 +924,7 @@ function viewEdit(orig) {
                 inp.type = 'text';
               }),
           },
-          '⚄',
+          icon('dice'),
         ),
       );
     }
@@ -885,7 +953,7 @@ function viewEdit(orig) {
         { class: 'inline', style: 'margin-bottom:5px' },
         inp,
         sel,
-        el('button', { type: 'button', class: 'icon', onclick: () => (line.remove(), uriRows.splice(uriRows.indexOf(entry), 1)) }, '✕'),
+        el('button', { type: 'button', class: 'icon', onclick: () => (line.remove(), uriRows.splice(uriRows.indexOf(entry), 1)) }, icon('x')),
       );
       uriRows.push(entry);
       uriBox.append(line);
@@ -925,7 +993,7 @@ function viewEdit(orig) {
       name,
       val,
       type,
-      el('button', { type: 'button', class: 'icon', onclick: () => (line.remove(), fieldRows.splice(fieldRows.indexOf(entry), 1)) }, '✕'),
+      el('button', { type: 'button', class: 'icon', onclick: () => (line.remove(), fieldRows.splice(fieldRows.indexOf(entry), 1)) }, icon('x')),
     );
     fieldRows.push(entry);
     fieldBox.append(line);
@@ -1165,7 +1233,7 @@ async function viewSends() {
               }
             },
           },
-          '✕',
+          icon('x'),
         ),
       ),
     ),
@@ -1173,7 +1241,7 @@ async function viewSends() {
   render(
     header('Send', {
       back: () => viewMain(false),
-      actions: el('button', { class: 'icon', title: 'Neues Send', onclick: () => viewSendNew() }, '+'),
+      actions: iconBtn('plus', 'Neues Send', () => viewSendNew()),
     }),
     el('main', { class: 'flush' }, rows.length ? rows : el('div', { class: 'empty' }, 'Noch keine Sends.')),
   );
@@ -1276,19 +1344,55 @@ async function viewSettings() {
   }
   const s = r.settings;
   const save = (patch) => send('setSettings', { settings: patch }).catch((e) => toast(e.message));
-  const select = (key, options) => {
+  const select = (key, options, onSaved) => {
     const sel = el(
       'select',
-      { value: String(s[key]), onchange: () => save({ [key]: Number(sel.value) }) },
+      {
+        value: String(s[key]),
+        onchange: () => {
+          const v = options.find((o) => String(o[0]) === sel.value)[0];
+          save({ [key]: v });
+          if (onSaved) onSaved(v);
+        },
+      },
       options.map(([v, n]) => el('option', { value: v }, n)),
     );
     return sel;
   };
-  const toggle = (key, label) => {
+  const toggle = (key, label, hint) => {
     const c = el('input', { type: 'checkbox', onchange: () => save({ [key]: c.checked }) });
     c.checked = !!s[key];
-    return el('label', { class: 'check' }, c, label);
+    return [el('label', { class: 'check' }, c, label), hint && el('p', { class: 'muted small hint' }, hint)];
   };
+  const section = (title) => el('h2', { class: 'group' }, title);
+  const neverBox = el('div');
+  const drawNever = () =>
+    neverBox.replaceChildren(
+      ...(s.neverDomains.length
+        ? s.neverDomains.map((d) =>
+            el(
+              'div',
+              { class: 'field' },
+              el('div', { class: 'body' }, el('div', { class: 'v' }, d)),
+              el(
+                'button',
+                {
+                  class: 'icon small-icon',
+                  title: 'Entfernen',
+                  onclick: async () => {
+                    s.neverDomains = s.neverDomains.filter((x) => x !== d);
+                    await save({ neverDomains: s.neverDomains });
+                    drawNever();
+                  },
+                },
+                icon('x'),
+              ),
+            ),
+          )
+        : [el('p', { class: 'muted small' }, 'Keine – Speichern wird überall angeboten.')]),
+    );
+  drawNever();
+  const neverInput = el('input', { type: 'text', placeholder: 'example.com' });
   const act = (label, fn, cls) => el('button', { class: cls || '', onclick: busy(null, fn) }, label);
   const again = async (msg) => (toast(msg), viewSettings());
 
@@ -1300,7 +1404,7 @@ async function viewSettings() {
   render(
     header('Einstellungen', {
       back: () => viewMain(),
-      actions: !inTab && el('button', { class: 'icon', title: 'In Tab öffnen', onclick: () => openTab('settings') }, '↗'),
+      actions: !inTab && iconBtn('external', 'In Tab öffnen', () => openTab('settings')),
     }),
     el(
       'main',
@@ -1318,7 +1422,8 @@ async function viewSettings() {
       ),
       el('button', { class: 'link', onclick: () => viewLogin(true) }, '+ Konto hinzufügen'),
 
-      el('label', {}, 'Automatisch sperren nach'),
+      section('Kontosicherheit'),
+      el('label', {}, 'Tresor-Timeout'),
       select('timeout', [
         [1, '1 Minute'],
         [5, '5 Minuten'],
@@ -1326,9 +1431,14 @@ async function viewSettings() {
         [30, '30 Minuten'],
         [60, '1 Stunde'],
         [240, '4 Stunden'],
-        [0, 'Erst beim Beenden von Safari'],
+        [0, 'Beim Neustart des Browsers'],
       ]),
-
+      el('label', {}, 'Timeout-Aktion'),
+      select('timeoutAction', [
+        ['lock', 'Sperren'],
+        ['logout', 'Abmelden'],
+      ]),
+      el('p', { class: 'muted small hint' }, 'Abmelden entfernt die lokalen Tresordaten aller Konten; danach ist eine neue Anmeldung (mit Zwei-Faktor) nötig.'),
       el('label', {}, 'Entsperren mit PIN'),
       r.hasPin
         ? act('PIN entfernen', async () => (await send('clearPin'), again('PIN entfernt')))
@@ -1338,6 +1448,70 @@ async function viewSettings() {
         ? act('Touch ID deaktivieren', async () => (await send('bioDisable'), again('Touch ID deaktiviert')))
         : act('Touch ID aktivieren', async () => (await send('bioEnable'), again('Touch ID aktiviert'))),
 
+      section('Automatisches Ausfüllen'),
+      el('label', {}, 'Standard-URI-Übereinstimmungserkennung'),
+      select('defaultMatch', [
+        [0, 'Basis-Domain'],
+        [1, 'Host'],
+        [2, 'Beginnt mit'],
+        [3, 'Exakt'],
+        [4, 'Regulärer Ausdruck'],
+        [5, 'Nie'],
+      ]),
+      el('p', { class: 'muted small hint' }, 'Gilt für alle Websites eines Eintrags, bei denen „Standard“ eingestellt ist.'),
+      toggle('autoCopyTotp', 'TOTP automatisch kopieren', 'Nach dem Ausfüllen eines Logins mit Einmalcode wird der Code in die Zwischenablage kopiert.'),
+      toggle('autoFill', 'Beim Laden der Seite automatisch ausfüllen', 'Nur auf https-Seiten. Kostet etwas Leistung auf Seiten mit Login-Formular.'),
+      toggle('inline', 'Auswahlmenü in Login-Feldern anzeigen'),
+      toggle('badge', 'Anzahl passender Logins am Symbol anzeigen'),
+      toggle(
+        'rememberHost',
+        'Verwendeten Login pro Subdomain merken',
+        'Nach dem Ausfüllen wird auf derselben Adresse nur noch dieser Login vorgeschlagen; die übrigen bleiben über „weitere“ erreichbar.',
+      ),
+      r.rememberedHosts > 0 &&
+        el(
+          'div',
+          { class: 'inline hint-row' },
+          el('span', { class: 'muted small' }, `${r.rememberedHosts} ${r.rememberedHosts === 1 ? 'Zuordnung' : 'Zuordnungen'} gespeichert`),
+          act('Alle vergessen', async () => (await send('forgetAllHosts'), again('Zuordnungen gelöscht'))),
+        ),
+      toggle('showCards', 'Karten unter „Diese Seite“ anzeigen'),
+      toggle('showIdentities', 'Identitäten unter „Diese Seite“ anzeigen'),
+
+      section('Benachrichtigungen'),
+      toggle('addPrompt', 'Fragen, ob neue Logins hinzugefügt werden sollen'),
+      toggle('updatePrompt', 'Fragen, ob geänderte Passwörter aktualisiert werden sollen'),
+      toggle('passkeys', 'Passkeys in RustWarden speichern und verwenden'),
+      el('label', {}, 'Ausgeschlossene Domains'),
+      neverBox,
+      el(
+        'div',
+        { class: 'inline' },
+        neverInput,
+        act('Hinzufügen', async () => {
+          const d = neverInput.value.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/[/:].*$/, '');
+          if (!d) return;
+          if (!s.neverDomains.includes(d)) s.neverDomains = [...s.neverDomains, d];
+          await save({ neverDomains: s.neverDomains });
+          neverInput.value = '';
+          drawNever();
+        }),
+      ),
+
+      section('Darstellung'),
+      el('label', {}, 'Design'),
+      select(
+        'theme',
+        [
+          ['system', 'Systemstandard'],
+          ['light', 'Hell'],
+          ['dark', 'Dunkel'],
+        ],
+        applyTheme,
+      ),
+      toggle('quickCopy', 'Schnellkopier-Aktionen in der Liste anzeigen'),
+
+      section('Sonstiges'),
       el('label', {}, 'Zwischenablage leeren nach'),
       select('clipClear', [
         [0, 'Nie'],
@@ -1346,14 +1520,6 @@ async function viewSettings() {
         [120, '2 Minuten'],
         [300, '5 Minuten'],
       ]),
-
-      el('label', {}, 'Auf Webseiten'),
-      toggle('savePrompt', 'Neue/geänderte Logins zum Speichern anbieten'),
-      toggle('passkeys', 'Passkeys in RustWarden speichern und verwenden'),
-      toggle('inline', 'Auswahlmenü unter Login-Feldern anzeigen'),
-      toggle('badge', 'Anzahl passender Logins am Symbol anzeigen'),
-      toggle('autoFill', 'Beim Laden der Seite automatisch ausfüllen (nur https)'),
-      el('p', { class: 'muted small' }, 'Die letzten drei Optionen kosten etwas Leistung auf Seiten mit Login-Formular und sind deshalb standardmäßig aus.'),
 
       el('label', {}, 'Synchronisierung'),
       el(
@@ -1427,6 +1593,9 @@ async function viewSettings() {
 
 async function start() {
   try {
+    try {
+      applyTheme(((await browser.storage.local.get('settings')).settings || {}).theme);
+    } catch {}
     data = null;
     tab = null;
     if (!inTab) {

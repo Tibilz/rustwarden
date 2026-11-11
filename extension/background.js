@@ -10,7 +10,25 @@ const HEAD = {
   'Bitwarden-Client-Version': CLIENT_VERSION,
   'Device-Type': '20',
 };
-const DEFAULTS = { timeout: 15, savePrompt: true, clipClear: 0, badge: false, autoFill: false, inline: false, passkeys: true };
+const DEFAULTS = {
+  timeout: 15,
+  timeoutAction: 'lock', // 'lock' | 'logout'
+  clipClear: 0,
+  addPrompt: true,
+  updatePrompt: true,
+  neverDomains: [],
+  defaultMatch: 0, // 0 Basis-Domain, 1 Host, 2 Beginnt mit, 3 Exakt, 4 Regex, 5 Nie
+  autoCopyTotp: true,
+  badge: false,
+  autoFill: false,
+  inline: false,
+  passkeys: true,
+  rememberHost: true, // zuletzt verwendeten Login pro Host merken
+  quickCopy: true,
+  showCards: false,
+  showIdentities: false,
+  theme: 'system', // 'system' | 'light' | 'dark'
+};
 const EXT = browser.runtime.getURL('');
 
 const L = browser.storage.local;
@@ -140,7 +158,13 @@ async function deviceId() {
 }
 
 async function settings() {
-  return { ...DEFAULTS, ...((await lget('settings')) || {}) };
+  const saved = (await lget('settings')) || {};
+  const st = { ...DEFAULTS, ...saved, _set: saved };
+  // Frühere Version hatte nur einen Schalter für beide Speicher-Angebote.
+  if (st.savePrompt === false && !('addPrompt' in st._set)) st.addPrompt = st.updatePrompt = false;
+  delete st._set;
+  delete st.savePrompt;
+  return st;
 }
 
 async function native(msg) {
@@ -830,7 +854,7 @@ function parseUrl(u) {
   }
 }
 
-function matcher(tabUrl, eq) {
+function matcher(tabUrl, eq, defaultMatch = 0) {
   const tab = parseUrl(tabUrl || '');
   if (!tab || !/^https?:$/.test(tab.protocol)) return () => false;
   const tb = baseDomain(tab.hostname);
@@ -840,7 +864,7 @@ function matcher(tabUrl, eq) {
     if (v.type !== 1 || v.deletedDate || !v.login || !v.login.uris) return false;
     return v.login.uris.some((u) => {
       if (!u || !u.uri) return false;
-      switch (u.match ?? 0) {
+      switch (u.match ?? defaultMatch) {
         case 5:
           return false;
         case 4:
@@ -869,8 +893,59 @@ function matcher(tabUrl, eq) {
 const byName = (a, b) => (b.favorite ? 1 : 0) - (a.favorite ? 1 : 0) || String(a.name).localeCompare(String(b.name));
 
 async function matchesFor(url) {
-  const m = matcher(url, await aget('eq'));
+  const m = matcher(url, await aget('eq'), (await settings()).defaultMatch);
   return (await getViews()).ciphers.filter(m).sort(byName);
+}
+
+// ---------- Gemerkter Login pro Host ----------
+// Zuordnung Host → Eintrag, lokal und mit dem Benutzerschlüssel verschlüsselt (Hostnamen verraten den Verlauf).
+
+function hostOf(url) {
+  try {
+    const u = new URL(url);
+    return /^https?:$/.test(u.protocol) ? u.host.toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+async function hostMap() {
+  const blob = await aget('hosts');
+  const session = await getSession();
+  if (!blob || !session) return {};
+  try {
+    return JSON.parse((await core()).text_decrypt(JSON.parse(session).user, blob));
+  } catch {
+    return {};
+  }
+}
+
+async function saveHostMap(map) {
+  if (!Object.keys(map).length) return adel('hosts');
+  const c = await core();
+  await aset({ hosts: c.text_encrypt(JSON.parse(await needSession()).user, JSON.stringify(map)) });
+}
+
+async function rememberHost(url, id) {
+  const host = hostOf(url);
+  if (!host || !(await settings()).rememberHost) return;
+  if (!(await matchesFor(url)).some((v) => v.id === id)) return;
+  const map = await hostMap();
+  if (map[host] === id) return;
+  map[host] = id;
+  await saveHostMap(map);
+}
+
+// Vorschläge für eine Seite: der gemerkte Login allein, die übrigen Treffer als „weitere“.
+async function suggestionsFor(url) {
+  const all = await matchesFor(url);
+  const host = hostOf(url);
+  if (host && all.length > 1 && (await settings()).rememberHost) {
+    const id = (await hostMap())[host];
+    const hit = all.find((v) => v.id === id);
+    if (hit) return { list: [hit], others: all.filter((v) => v !== hit), remembered: id };
+  }
+  return { list: all, others: [], remembered: null };
 }
 
 function subtitle(v) {
@@ -919,6 +994,8 @@ async function evalPending() {
   if (logins.some((v) => v.login.password === p.password && (!u || userOf(v) === u))) return drop();
   const host = new URL(p.url).hostname;
   const hit = u ? logins.find((v) => userOf(v) === u) : logins.length === 1 ? logins[0] : null;
+  const st = await settings();
+  if (hit ? !st.updatePrompt : !st.addPrompt) return drop();
   setBadge('+');
   return hit
     ? { kind: 'update', id: hit.id, name: hit.name, host, username: p.username }
@@ -1101,7 +1178,7 @@ async function autofillTab(tab) {
     await browser.action.openPopup();
     return;
   }
-  const m = (await matchesFor(tab.url)).filter((v) => v.reprompt !== 1);
+  const m = (await suggestionsFor(tab.url)).list.filter((v) => v.reprompt !== 1);
   if (m.length) {
     await fill(m[0].id, tab.id);
     await touch();
@@ -1389,17 +1466,20 @@ const handlers = {
     const v = await getViews();
     const last = (await aget('lastSync')) || 0;
     if (Date.now() - last > 30 * 60000) syncInBackground();
-    let matchIds = [];
-    if (m.url) matchIds = (await matchesFor(m.url)).map((x) => x.id);
+    let sug = { list: [], others: [], remembered: null };
+    if (m.url) sug = await suggestionsFor(m.url);
     const profile = (await aget('profile')) || {};
     return {
       items: v.ciphers.map(slim).sort((a, b) => a.name.localeCompare(b.name)),
-      matchIds,
+      matchIds: sug.list.map((x) => x.id),
+      otherMatchIds: sug.others.map((x) => x.id),
+      rememberedId: sug.remembered,
       folders: v.folders,
       collections: v.collections,
       orgs: (profile.organizations || []).map((o) => ({ id: o.id, name: o.name })),
       pending: await evalPending().catch(() => null),
       lastSync: last,
+      settings: await settings(),
     };
   },
   async get(m) {
@@ -1409,7 +1489,25 @@ const handlers = {
     return { totp: await totpFor(await getView(m.id)) };
   },
   async fill(m) {
-    return fill(m.id, m.tabId);
+    const r = await fill(m.id, m.tabId);
+    if (r.filled) {
+      const t = await browser.tabs.get(m.tabId).catch(() => null);
+      if (t && t.url) await rememberHost(t.url, m.id).catch(() => {});
+    }
+    return r;
+  },
+  async forgetHost(m) {
+    const host = hostOf(m.url);
+    const map = await hostMap();
+    if (host && host in map) {
+      delete map[host];
+      await saveHostMap(map);
+    }
+    return {};
+  },
+  async forgetAllHosts() {
+    await adel('hosts');
+    return {};
   },
   async save(m) {
     return saveCipher(m.view);
@@ -1438,6 +1536,17 @@ const handlers = {
   async pendingAccept() {
     return acceptPending();
   },
+  async neverDomain() {
+    const p = await sget('pendingSave');
+    if (p) {
+      const host = new URL(p.url).hostname;
+      const st = await settings();
+      if (!st.neverDomains.includes(host)) await L.set({ settings: { ...st, neverDomains: [...st.neverDomains, host] } });
+    }
+    await S.remove('pendingSave');
+    setBadge('');
+    return {};
+  },
   async pendingDismiss() {
     await S.remove('pendingSave');
     setBadge('');
@@ -1461,17 +1570,23 @@ const handlers = {
       accounts: (await accountList()).map((a) => ({ id: a.id, email: a.email, server: a.server })),
       hasPin: !!(await aget('pin')),
       hasBio: !!(await aget('bio')),
+      rememberedHosts: Object.keys(await hostMap()).length,
     };
   },
   async setSettings(m) {
-    await L.set({ settings: { ...(await settings()), ...m.settings } });
+    const patch = { ...(m.settings || {}) };
+    if ('neverDomains' in patch) {
+      patch.neverDomains = [...new Set((patch.neverDomains || []).map((d) => String(d).trim().toLowerCase().replace(/^\*?\./, '')).filter(Boolean))];
+    }
+    if ('defaultMatch' in patch && ![0, 1, 2, 3, 4, 5].includes(patch.defaultMatch)) throw new Error('Ungültige Übereinstimmungserkennung');
+    await L.set({ settings: { ...(await settings()), ...patch } });
     if (await getSession()) await touch();
     return {};
   },
   // --- aus dem Inline-Menü (iframe in der Webseite) ---
   async inlineList(m, sender) {
     if (!(await getSession())) return { locked: true, items: [] };
-    const items = (await matchesFor(sender.tab.url))
+    const items = (await suggestionsFor(sender.tab.url)).list
       .filter((v) => v.reprompt !== 1)
       .map((v) => ({ id: v.id, name: v.name || '', sub: subtitle(v) }));
     return { items };
@@ -1480,7 +1595,9 @@ const handlers = {
     // Nur Einträge, die zur Seite des Tabs passen – das iframe kann nichts anderes anfordern.
     const ok = (await matchesFor(sender.tab.url)).some((v) => v.id === m.id && v.reprompt !== 1);
     if (!ok) throw new Error('Eintrag passt nicht zu dieser Seite');
-    return fill(m.id, sender.tab.id);
+    const r = await fill(m.id, sender.tab.id);
+    if (r.filled) await rememberHost(sender.tab.url, m.id).catch(() => {});
+    return r;
   },
   async openPopup() {
     await browser.action.openPopup();
@@ -1493,9 +1610,21 @@ const handlers = {
 const FRAME_ONLY = new Set(['inlineList', 'inlineFill', 'pkInfo', 'pkFinish']);
 const FRAME_CMDS = new Set([...FRAME_ONLY, 'openPopup']);
 
+function excluded(url, list) {
+  let host;
+  try {
+    host = new URL(url).hostname;
+  } catch {
+    return true;
+  }
+  return (list || []).some((d) => host === d || host.endsWith('.' + d));
+}
+
 async function onSubmitted(m) {
-  if (!(await settings()).savePrompt || !(await aid())) return;
+  const st = await settings();
+  if ((!st.addPrompt && !st.updatePrompt) || !(await aid())) return;
   if (typeof m.password !== 'string' || !m.password || !/^https?:/.test(m.url || '')) return;
+  if (excluded(m.url, st.neverDomains)) return;
   await S.set({
     pendingSave: { url: m.url, username: String(m.username || ''), password: m.password, ts: Date.now() },
   });
@@ -1506,7 +1635,7 @@ async function onSubmitted(m) {
 async function onLoginPage(sender) {
   const s = await settings();
   if ((!s.badge && !s.autoFill) || !sender.tab || !(await getSession())) return;
-  const m = await matchesFor(sender.tab.url);
+  const m = (await suggestionsFor(sender.tab.url)).list;
   if (s.badge) setBadge(m.length ? String(m.length) : '', sender.tab.id);
   const usable = m.filter((v) => v.reprompt !== 1);
   if (s.autoFill && usable.length && /^https:/.test(sender.tab.url || '')) await fill(usable[0].id, sender.tab.id);
@@ -1545,8 +1674,18 @@ browser.runtime.onMessage.addListener((m, sender, respond) => {
   return true;
 });
 
+async function logoutAll() {
+  for (const a of await accountList()) {
+    await switchTo(a.id);
+    await logout();
+  }
+}
+
 browser.alarms.onAlarm.addListener(async (a) => {
-  if (a.name === 'lock') await lock(true);
+  if (a.name === 'lock') {
+    if ((await settings()).timeoutAction === 'logout') await logoutAll();
+    else await lock(true);
+  }
   else if (a.name === 'clip') {
     const hash = await sget('clip');
     await S.remove('clip');
@@ -1574,6 +1713,10 @@ function setupMenus() {
 }
 browser.runtime.onInstalled.addListener(setupMenus);
 browser.runtime.onStartup.addListener(setupMenus);
+// Nach einem Browser-Neustart sind die Sitzungen weg – bei Timeout-Aktion „Abmelden“ heißt das: abmelden.
+browser.runtime.onStartup.addListener(async () => {
+  if ((await settings()).timeoutAction === 'logout') await logoutAll().catch(() => {});
+});
 if (browser.contextMenus) {
   browser.contextMenus.onClicked.addListener((info, tab) => {
     if (info.menuItemId === 'fill') autofillTab(tab).catch(() => {});

@@ -19,6 +19,8 @@ const store = () => {
 };
 const ev = () => ({ fns: [], addListener(f) { this.fns.push(f); } });
 const injected = [];
+const tabsById = {};
+let activeTab = null;
 const alarms = {};
 const browser = {
   storage: { local: store(), session: store() },
@@ -32,7 +34,10 @@ const browser = {
   commands: { onCommand: ev() },
   contextMenus: { removeAll: async () => {}, create: () => {}, onClicked: ev() },
   scripting: { executeScript: async (o) => (injected.push(o), [{ result: true }]) },
-  tabs: { query: async () => [] },
+  tabs: {
+    query: async () => (activeTab ? [activeTab] : []),
+    get: async (id) => tabsById[id] || { id, url: 'about:blank' },
+  },
 };
 const realFetch = fetch;
 const ctx = vm.createContext({
@@ -176,6 +181,91 @@ async function register(w, email, password, kdf) {
   await call('sendDelete', { id: sends[0].id });
   ok((await call('sends')).sends.length === 1, 'Send gelöscht');
 
+  console.log('Einstellungen');
+  await browser.storage.local.set({ settings: { savePrompt: false } });
+  let mig = (await call('getSettings')).settings;
+  ok(mig.addPrompt === false && mig.updatePrompt === false && !('savePrompt' in mig), 'alte Einstellung „Speichern anbieten: aus“ wird übernommen');
+  await call('setSettings', { settings: { addPrompt: true, updatePrompt: true } });
+  mig = (await call('getSettings')).settings;
+  ok(mig.addPrompt && mig.updatePrompt, 'danach gelten die neuen Schalter');
+  ok((await call('list', { url: 'https://www.example.com/' })).matchIds.includes(id), 'Standard-Übereinstimmung: Basis-Domain');
+  await call('setSettings', { settings: { defaultMatch: 1 } });
+  ok(!(await call('list', { url: 'https://www.example.com/' })).matchIds.includes(id), 'Standard-Übereinstimmung „Host“: andere Subdomain passt nicht');
+  ok((await call('list', { url: 'https://login.example.com/abc' })).matchIds.includes(id), 'Standard-Übereinstimmung „Host“: gleicher Host passt');
+  await call('setSettings', { settings: { defaultMatch: 5 } });
+  ok(!(await call('list', { url: 'https://login.example.com/abc' })).matchIds.includes(id), 'Standard-Übereinstimmung „Nie“');
+  await call('setSettings', { settings: { defaultMatch: 0 } });
+  ok((await call('list', {})).settings.defaultMatch === 0, 'Liste liefert die Einstellungen mit');
+
+  const wait = () => new Promise((r) => setTimeout(r, 300));
+  const NEW = { id: 'rwid', url: 'https://shop.example.org/login', tab: { id: 8, url: 'https://shop.example.org/login' } };
+  await call('setSettings', { settings: { addPrompt: false } });
+  await raw('submitted', { url: NEW.url, username: 'dave', password: 'pw1' }, NEW);
+  await wait();
+  ok(!(await call('list', {})).pending, '„Hinzufügen anbieten“ aus: kein Angebot für neuen Login');
+  await call('setSettings', { settings: { addPrompt: true, updatePrompt: false } });
+  await raw('submitted', { url: WEB.url, username: 'carol', password: 'anderes' }, WEB);
+  await wait();
+  ok(!(await call('list', {})).pending, '„Aktualisieren anbieten“ aus: kein Angebot für geändertes Passwort');
+  await call('setSettings', { settings: { updatePrompt: true } });
+  await raw('submitted', { url: WEB.url, username: 'carol', password: 'anderes' }, WEB);
+  await wait();
+  ok((await call('list', {})).pending.kind === 'update', '„Aktualisieren anbieten“ an: Angebot erscheint');
+  await call('neverDomain');
+  ok(!(await call('list', {})).pending, '„Nie für diese Seite“ verwirft das Angebot');
+  ok((await call('getSettings')).settings.neverDomains.includes('neu.example.net'), 'Domain landet in den ausgeschlossenen Domains');
+  await raw('submitted', { url: WEB.url, username: 'carol', password: 'nochmal' }, WEB);
+  await wait();
+  ok(!(await call('list', {})).pending, 'ausgeschlossene Domain: kein Angebot mehr');
+  await call('setSettings', { settings: { neverDomains: [] } });
+  ok((await call('get', { id: (await call('list', { url: WEB.url })).matchIds[0] })).item.login.password === 'pw-neu', 'Passwort blieb unverändert');
+
+  console.log('Gemerkter Login pro Host');
+  {
+    const mk = async (name, user) =>
+      (await call('save', { view: { type: 1, name, login: { username: user, password: 'pw-' + user, uris: [{ uri: 'https://example.com', match: null }] }, fields: [] } })).id;
+    const one = await mk('Konto Eins', 'eins');
+    const two = await mk('Konto Zwei', 'zwei');
+    const APP = 'https://app.example.com/start';
+    tabsById[11] = { id: 11, url: APP };
+    let l = await call('list', { url: APP });
+    ok(l.matchIds.length === 3 && !l.otherMatchIds.length, 'ohne Zuordnung: alle passenden Logins');
+    await call('fill', { id: two, tabId: 11 });
+    l = await call('list', { url: APP });
+    ok(l.matchIds.length === 1 && l.matchIds[0] === two && l.otherMatchIds.length === 2 && l.rememberedId === two, 'nach dem Ausfüllen: nur noch der verwendete Login, die anderen als „weitere“');
+    ok((await call('list', { url: 'https://app.example.com/anderer/pfad?x=1' })).matchIds.length === 1, 'gilt für den ganzen Host, unabhängig vom Pfad');
+    ok((await call('list', { url: 'https://other.example.com/' })).matchIds.length === 3, 'andere Subdomain: weiterhin alle');
+    const APPFRAME = { id: 'rwid', url: EXT + 'inline.html', frameId: 6, tab: { id: 11, url: APP } };
+    const il = await raw('inlineList', {}, APPFRAME);
+    ok(il.items.length === 1 && il.items[0].id === two, 'Auswahlmenü zeigt nur den gemerkten Login');
+    activeTab = tabsById[11];
+    injected.length = 0;
+    browser.commands.onCommand.fns[0]('autofill');
+    await new Promise((r) => setTimeout(r, 300));
+    ok(injected.length && injected[injected.length - 1].args[0].username === 'zwei', 'Tastenkürzel füllt den gemerkten Login');
+    activeTab = null;
+    await raw('inlineFill', { id: one }, APPFRAME);
+    ok((await call('list', { url: APP })).rememberedId === one, 'Auswahl eines anderen Logins merkt den neuen');
+    ok(!Object.entries(browser.storage.local.d).some(([k, v]) => (k + JSON.stringify(v)).includes('app.example.com')), 'Hostnamen liegen nicht im Klartext im Speicher');
+    await call('forgetHost', { url: APP });
+    ok((await call('list', { url: APP })).matchIds.length === 3, '„Zuordnung vergessen“ zeigt wieder alle');
+    await call('fill', { id: one, tabId: 11 });
+    await call('remove', { id: one });
+    l = await call('list', { url: APP });
+    ok(l.matchIds.length === 2 && !l.rememberedId, 'gemerkter Login gelöscht: Zuordnung wird ignoriert');
+    await call('setSettings', { settings: { rememberHost: false } });
+    await call('fill', { id: two, tabId: 11 });
+    ok((await call('list', { url: APP })).matchIds.length === 2, 'Einstellung aus: nichts wird gemerkt oder gefiltert');
+    await call('setSettings', { settings: { rememberHost: true } });
+    await call('fill', { id: two, tabId: 11 });
+    ok((await call('getSettings')).rememberedHosts === 1, 'Einstellungen zeigen die Anzahl gemerkter Zuordnungen');
+    await call('forgetAllHosts');
+    ok((await call('getSettings')).rememberedHosts === 0 && (await call('list', { url: APP })).matchIds.length === 2, 'alle Zuordnungen zurücksetzen');
+    await call('remove', { id: one });
+    await call('remove', { id: two });
+    await call('remove', { id: two });
+  }
+
   console.log('Passkeys');
   {
   const sha = (b) => nc.createHash('sha256').update(b).digest();
@@ -272,8 +362,12 @@ async function register(w, email, password, kdf) {
   await call('logout');
   ok((await call('status')).email === B.email, 'Abmelden von A → B wird aktiv');
   ok(!Object.keys(browser.storage.local.d).some((k) => k.includes(A.email)), 'lokale Daten von A entfernt');
-  await call('logout');
-  ok((await call('status')).state === 'loggedOut', 'vollständig abgemeldet');
+  await call('unlock', { password: B.password });
+  await call('setSettings', { settings: { timeoutAction: 'logout' } });
+  await browser.alarms.onAlarm.fns[0]({ name: 'lock' });
+  ok((await call('status')).state === 'loggedOut', 'Timeout-Aktion „Abmelden“ meldet ab');
+  ok(!Object.keys(browser.storage.local.d).some((k) => k.startsWith('a:')), 'keine Kontodaten mehr gespeichert');
+  ok((await call('getSettings')).settings.timeoutAction === 'logout', 'Einstellungen bleiben nach dem Abmelden erhalten');
 
   console.log(`\nE2E OK – ${n} Prüfungen gegen ${BASE}`);
 })().catch((e) => { console.error('\n' + (e.stack || e)); process.exit(1); });
