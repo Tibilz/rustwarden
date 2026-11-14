@@ -39,10 +39,10 @@ pub fn password(o: &Value) -> R<String> {
         sets.push((strip("abcdefghijklmnopqrstuvwxyz"), 1));
     }
     if flag(o, "numbers", true) {
-        sets.push((strip("0123456789"), o["minNumbers"].as_u64().unwrap_or(1).max(1) as usize));
+        sets.push((strip("0123456789"), o["minNumbers"].as_u64().unwrap_or(1).clamp(1, len as u64) as usize));
     }
     if flag(o, "special", true) {
-        sets.push((b"!@#$%^&*".to_vec(), o["minSpecial"].as_u64().unwrap_or(1).max(1) as usize));
+        sets.push((b"!@#$%^&*".to_vec(), o["minSpecial"].as_u64().unwrap_or(1).clamp(1, len as u64) as usize));
     }
     if sets.is_empty() {
         sets.push((strip("abcdefghijklmnopqrstuvwxyz"), 1));

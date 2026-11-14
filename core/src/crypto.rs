@@ -53,13 +53,31 @@ impl Key {
 /// `kdf`: { kdf: 0 (PBKDF2) | 1 (Argon2id), kdfIterations, kdfMemory, kdfParallelism }
 pub fn derive(email: &str, password: &str, kdf: &Value) -> R<([u8; 32], String)> {
     let email = email.trim().to_lowercase();
-    let iters = kdf["kdfIterations"].as_u64().unwrap_or(600_000) as u32;
+    // Grenzen wie in den offiziellen Clients: ein bösartiger Server darf weder eine billige KDF
+    // (Brute-Force des Login-Hashs) noch absurde Werte (Hänger/Speicherüberlauf) erzwingen.
+    let num = |k: &str, default: u64| -> R<u64> {
+        match &kdf[k] {
+            Value::Null => Ok(default),
+            v => v.as_u64().ok_or_else(|| format!("Ungültiger KDF-Parameter {k}")),
+        }
+    };
+    let bound = |name: &str, v: u64, lo: u64, hi: u64| -> R<u32> {
+        if v < lo || v > hi {
+            Err(format!("Server verlangt unsichere KDF-Einstellung ({name} = {v}, erlaubt {lo}–{hi})"))
+        } else {
+            Ok(v as u32)
+        }
+    };
     let mut mk = [0u8; 32];
-    match kdf["kdf"].as_u64().unwrap_or(0) {
-        0 => pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), email.as_bytes(), iters, &mut mk),
+    match num("kdf", 0)? {
+        0 => {
+            let iters = bound("Iterationen", num("kdfIterations", 600_000)?, 100_000, 2_000_000)?;
+            pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), email.as_bytes(), iters, &mut mk)
+        }
         1 => {
-            let mem = kdf["kdfMemory"].as_u64().unwrap_or(64) as u32;
-            let par = kdf["kdfParallelism"].as_u64().unwrap_or(4) as u32;
+            let iters = bound("Iterationen", num("kdfIterations", 3)?, 2, 10)?;
+            let mem = bound("Speicher (MiB)", num("kdfMemory", 64)?, 16, 1024)?;
+            let par = bound("Parallelität", num("kdfParallelism", 4)?, 1, 16)?;
             let salt = Sha256::digest(email.as_bytes());
             let params = argon2::Params::new(mem * 1024, iters, par, Some(32))
                 .map_err(|e| format!("Ungültige Argon2-Parameter: {e}"))?;
@@ -96,7 +114,10 @@ pub fn enc_type(s: &str) -> Option<u8> {
 pub fn decrypt(s: &str, key: &Key) -> R<Vec<u8>> {
     let (t, p) = split(s)?;
     let (iv, ct) = match (t, p.len()) {
-        (0, 2) => (unb64(p[0])?, unb64(p[1])?),
+        // Typ 0 hat keinen MAC: nur für Altschlüssel ohne MAC-Anteil zulassen, sonst könnte ein
+        // Server authentifizierte Daten durch unauthentifizierte ersetzen (Downgrade).
+        (0, 2) if key.mac.is_none() => (unb64(p[0])?, unb64(p[1])?),
+        (0, 2) => return Err("Unauthentifizierte Daten (Typ 0) abgelehnt".into()),
         (2, 3) => {
             let (iv, ct, tag) = (unb64(p[0])?, unb64(p[1])?, unb64(p[2])?);
             let mk = key.mac.as_ref().ok_or("Schlüssel ohne MAC-Anteil")?;
@@ -140,7 +161,7 @@ pub fn rsa_decrypt(s: &str, pk: &RsaPrivateKey) -> R<Vec<u8>> {
         4 | 6 => Oaep::new::<sha1::Sha1>(),
         _ => return Err(format!("Nicht unterstützter RSA-Typ {t}")),
     };
-    pk.decrypt(pad, &data).map_err(|_| "RSA-Entschlüsselung fehlgeschlagen".to_string())
+    pk.decrypt_blinded(&mut rand_core::OsRng, pad, &data).map_err(|_| "RSA-Entschlüsselung fehlgeschlagen".to_string())
 }
 
 /// Binärformat für Anhänge/Send-Dateien: [Typ 2][IV 16][MAC 32][Ciphertext]

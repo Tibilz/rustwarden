@@ -40,18 +40,48 @@ const browser = {
   },
 };
 const realFetch = fetch;
+let fakePrelogin = null; // simuliert einen bösartigen Server, der eine schwache KDF vorgibt
 const ctx = vm.createContext({
   browser, console, URL, URLSearchParams, FormData, Blob, TextEncoder, TextDecoder, WebAssembly, structuredClone,
   crypto: nc.webcrypto, atob, btoa, setTimeout,
   fetch: async (u, init) =>
     String(u).startsWith(EXT)
-      ? { arrayBuffer: async () => new Uint8Array(fs.readFileSync(EXT_DIR + '/' + String(u).slice(EXT.length))) }
-      : realFetch(u, init),
+      ? {
+          arrayBuffer: async () => new Uint8Array(fs.readFileSync(EXT_DIR + '/' + String(u).slice(EXT.length))),
+          text: async () => fs.readFileSync(EXT_DIR + '/' + String(u).slice(EXT.length), 'utf8'),
+        }
+      : fakePrelogin && String(u).endsWith('/accounts/prelogin')
+        ? new Response(JSON.stringify(fakePrelogin), { status: 200, headers: { 'Content-Type': 'application/json' } })
+        : realFetch(u, init),
 });
 for (const f of ['wasm/rw_core.js', 'background.js']) vm.runInContext(fs.readFileSync(`${EXT_DIR}/${f}`, 'utf8'), ctx, { filename: f });
-vm.runInContext('globalThis.__core = core;', ctx);
+vm.runInContext('globalThis.__core = core; globalThis.__fillPage = fillPage;', ctx);
+
+// fillPage in einer nachgebildeten Seite ausführen (Origin + ein Passwortfeld).
+function runFillPage(origin, d) {
+  const field = { tagName: 'INPUT', type: 'password', value: '', form: null, getAttribute: (k) => (k === 'type' ? 'password' : null),
+    getBoundingClientRect: () => ({ width: 100, height: 20 }), focus() {}, dispatchEvent() {}, disabled: false, readOnly: false };
+  const win = {};
+  win.top = win;
+  const page = vm.createContext({
+    window: win, location: { origin }, Event: class { constructor(t) { this.type = t; } },
+    getComputedStyle: () => ({ visibility: 'visible' }),
+    HTMLInputElement: { prototype: Object.defineProperty({}, 'value', { set(v) { this.value_ = v; } }) },
+    HTMLTextAreaElement: { prototype: {} },
+    document: { querySelectorAll: () => [field] },
+  });
+  page.__d = d;
+  const r = vm.runInContext(`(${ctx.__fillPage.toString()})(__d)`, page);
+  return { r, value: field.value_ };
+}
 
 const POPUP = { id: 'rwid', url: EXT + 'popup.html' };
+// Inline-Menü-Token, wie es das Content-Script im Top-Frame des Tabs vergibt
+async function inlineToken(tab) {
+  const token = nc.randomBytes(16).toString('hex');
+  await raw('inlineToken', { token }, { id: 'rwid', url: tab.url, tab });
+  return token;
+}
 function raw(cmd, extra, sender = POPUP) {
   return new Promise((resolve) => {
     const r = browser.runtime.onMessage.fns[0]({ cmd, ...(extra || {}) }, sender, resolve);
@@ -102,6 +132,12 @@ async function register(w, email, password, kdf) {
   console.log('Konten registriert (PBKDF2 + Argon2id)');
 
   console.log('Anmeldung');
+  await fails(call('login', { server: { region: 'self', base: 'http://vault.example.com' }, email: A.email, password: A.password }), /https/, 'unverschlüsselte Server-URL (außer localhost) wird abgelehnt');
+  fakePrelogin = { kdf: 0, kdfIterations: 1 };
+  await fails(call('login', { server, email: A.email, password: A.password }), /unsichere KDF/, 'Server mit schwacher KDF (1 Iteration) wird abgelehnt');
+  fakePrelogin = { kdf: 1, kdfIterations: 3, kdfMemory: 8192, kdfParallelism: 4 };
+  await fails(call('login', { server, email: A.email, password: A.password }), /unsichere KDF/, 'Server mit absurdem Argon2-Speicher wird abgelehnt');
+  fakePrelogin = null;
   ok((await call('status')).state === 'loggedOut', 'Start: abgemeldet');
   await fails(call('login', { server, email: A.email, password: 'falsch' }), /falsch|invalid/i, 'falsches Passwort wird abgelehnt');
   ok((await call('login', { server, email: A.email.toUpperCase(), password: A.password })).step === 'done', 'Login Konto A (PBKDF2)');
@@ -122,8 +158,10 @@ async function register(w, email, password, kdf) {
   ok(list.matchIds.includes(id), 'URL-Abgleich über Basis-Domain');
   ok(!(await call('list', { url: 'https://example.org/' })).matchIds.length, 'fremde Domain: kein Treffer');
   ok(/^\d{6}$/.test((await call('totp', { id })).totp.code), 'TOTP-Code');
+  tabsById[7] = { id: 7, url: 'https://login.example.com/x' };
   const f = await call('fill', { id, tabId: 7 });
   ok(f.filled && injected[0].args[0].password === 'erstes' && injected[0].target.tabId === 7, 'Ausfüllen injiziert die richtigen Daten');
+  ok(injected[0].args[0].origin === 'https://login.example.com', 'Ausfüllen ist an die Origin der Seite gebunden');
 
   const { id: folderId } = await call('folder', { name: 'Arbeit' });
   it.login.password = 'zweites'; it.folderId = folderId;
@@ -146,13 +184,18 @@ async function register(w, email, password, kdf) {
   await new Promise((r) => setTimeout(r, 300));
   list = await call('list', {});
   ok(list.pending && list.pending.kind === 'new' && list.pending.host === 'neu.example.net', 'neuer Login wird zum Speichern angeboten');
-  await call('pendingAccept');
+  await fails(call('pendingAccept', { ts: 1 }), /geändert/, 'Speichern einer inzwischen ersetzten Abfrage wird abgelehnt');
+  await call('pendingAccept', { ts: list.pending.ts });
   list = await call('list', { url: WEB.url });
   ok(list.matchIds.length === 1 && !list.pending, 'angebotener Login gespeichert');
   const FRAME = { id: 'rwid', url: EXT + 'inline.html', frameId: 5, tab: { id: 3, url: WEB.url } };
-  ok((await raw('inlineList', {}, FRAME)).items.length === 1, 'Inline-Menü listet passende Logins');
+  ok((await raw('inlineList', {}, FRAME)).ok === false, 'Inline-Menü ohne Token (fremdes iframe bettet inline.html ein) wird abgelehnt');
+  ok((await raw('inlineList', { token: 'geraten' }, FRAME)).ok === false, 'Inline-Menü mit falschem Token wird abgelehnt');
+  const tok3 = await inlineToken(FRAME.tab);
+  ok((await raw('inlineList', { token: tok3 }, { ...FRAME, tab: { id: 9, url: WEB.url } })).ok === false, 'Token gilt nur für den eigenen Tab');
+  ok((await raw('inlineList', { token: tok3 }, FRAME)).items.length === 1, 'Inline-Menü listet passende Logins');
   ok((await raw('get', { id }, FRAME)).ok === false, 'Inline-iframe darf keine Details abrufen');
-  ok((await raw('inlineFill', { id }, FRAME)).ok === false, 'Inline-iframe darf keine fremden Einträge ausfüllen');
+  ok((await raw('inlineFill', { id, token: tok3 }, FRAME)).ok === false, 'Inline-iframe darf keine fremden Einträge ausfüllen');
 
   console.log('Anhänge');
   const bytes = nc.randomBytes(70000);
@@ -236,7 +279,8 @@ async function register(w, email, password, kdf) {
     ok((await call('list', { url: 'https://app.example.com/anderer/pfad?x=1' })).matchIds.length === 1, 'gilt für den ganzen Host, unabhängig vom Pfad');
     ok((await call('list', { url: 'https://other.example.com/' })).matchIds.length === 3, 'andere Subdomain: weiterhin alle');
     const APPFRAME = { id: 'rwid', url: EXT + 'inline.html', frameId: 6, tab: { id: 11, url: APP } };
-    const il = await raw('inlineList', {}, APPFRAME);
+    const tok11 = await inlineToken(APPFRAME.tab);
+    const il = await raw('inlineList', { token: tok11 }, APPFRAME);
     ok(il.items.length === 1 && il.items[0].id === two, 'Auswahlmenü zeigt nur den gemerkten Login');
     activeTab = tabsById[11];
     injected.length = 0;
@@ -244,7 +288,7 @@ async function register(w, email, password, kdf) {
     await new Promise((r) => setTimeout(r, 300));
     ok(injected.length && injected[injected.length - 1].args[0].username === 'zwei', 'Tastenkürzel füllt den gemerkten Login');
     activeTab = null;
-    await raw('inlineFill', { id: one }, APPFRAME);
+    await raw('inlineFill', { id: one, token: tok11 }, APPFRAME);
     ok((await call('list', { url: APP })).rememberedId === one, 'Auswahl eines anderen Logins merkt den neuen');
     ok(!Object.entries(browser.storage.local.d).some(([k, v]) => (k + JSON.stringify(v)).includes('app.example.com')), 'Hostnamen liegen nicht im Klartext im Speicher');
     await call('forgetHost', { url: APP });
@@ -256,6 +300,7 @@ async function register(w, email, password, kdf) {
     await call('setSettings', { settings: { rememberHost: false } });
     await call('fill', { id: two, tabId: 11 });
     ok((await call('list', { url: APP })).matchIds.length === 2, 'Einstellung aus: nichts wird gemerkt oder gefiltert');
+    await call('forgetAllHosts');
     await call('setSettings', { settings: { rememberHost: true } });
     await call('fill', { id: two, tabId: 11 });
     ok((await call('getSettings')).rememberedHosts === 1, 'Einstellungen zeigen die Anzahl gemerkter Zuordnungen');
@@ -264,6 +309,73 @@ async function register(w, email, password, kdf) {
     await call('remove', { id: one });
     await call('remove', { id: two });
     await call('remove', { id: two });
+  }
+
+  console.log('Sicherheit: Abgleich, Ausfüllen, Timer');
+  {
+    const mk = async (name, uri) =>
+      (await call('save', { view: { type: 1, name, login: { username: 'u', password: 'p-' + name, uris: [{ uri, match: null }] }, fields: [] } })).id;
+    const vn = await mk('Bank VN', 'https://vietbank.com.vn/login');
+    const shop = await mk('Shop', 'https://meinshop.myshopify.com');
+    ok((await call('list', { url: 'https://www.vietbank.com.vn/' })).matchIds.includes(vn), 'PSL: Subdomain derselben Domain passt (com.vn)');
+    ok(!(await call('list', { url: 'https://evil.com.vn/' })).matchIds.includes(vn), 'PSL: fremde Domain unter com.vn passt nicht');
+    ok(!(await call('list', { url: 'https://evil.myshopify.com/' })).matchIds.includes(shop), 'PSL: fremder Shop unter myshopify.com passt nicht');
+    ok(!(await call('list', { url: 'https://vietbank.com.vn.evil.io/' })).matchIds.includes(vn), 'angehängte Fremddomain passt nicht');
+    ok(!(await call('list', { url: 'https://vietbank.com.vn@evil.io/' })).matchIds.includes(vn), 'Benutzerinfo in der URL täuscht den Abgleich nicht');
+    const VNEVIL = { id: 'rwid', url: 'https://evil.com.vn/', tab: { id: 21, url: 'https://evil.com.vn/' } };
+    const opts = { rp: { id: 'com.vn' }, user: { id: 'dQ', name: 'x' }, challenge: 'AAAA', pubKeyCredParams: [{ type: 'public-key', alg: -7 }] };
+    ok((await raw('pkBegin', { kind: 'create', options: opts }, VNEVIL)).error === 'SecurityError', 'Passkey: öffentliches Suffix als rpId wird abgelehnt');
+    const DOT = { id: 'rwid', url: 'https://example.net./', tab: { id: 22, url: 'https://example.net./' } };
+    ok((await raw('pkBegin', { kind: 'create', options: { ...opts, rp: { id: 'net.' } } }, DOT)).error === 'SecurityError', 'Passkey: rpId mit Schlusspunkt wird abgelehnt');
+
+    // https-Login nicht in http-Seite
+    tabsById[12] = { id: 12, url: 'http://login.example.com/x' };
+    const ins = await raw('fill', { id, tabId: 12 });
+    ok(ins.ok === false && ins.code === 'insecure', 'https-Login wird nicht ungefragt in eine http-Seite gefüllt');
+    ok((await call('fill', { id, tabId: 12, allowHttp: true })).filled, 'nach ausdrücklicher Bestätigung schon');
+    const HTTPFRAME = { id: 'rwid', url: EXT + 'inline.html', frameId: 5, tab: tabsById[12] };
+    const tok12 = await inlineToken(tabsById[12]);
+    ok((await raw('inlineFill', { id, token: tok12 }, HTTPFRAME)).ok === false, 'Inline-Menü füllt https-Login nicht in http-Seite');
+    // Seite hat zwischen Anzeige und Klick gewechselt
+    tabsById[13] = { id: 13, url: 'https://evil.example.org/' };
+    await fails(call('fill', { id, tabId: 13, url: 'https://login.example.com/x' }), /geändert/, 'Popup: Seitenwechsel vor dem Ausfüllen wird erkannt');
+    const fp = runFillPage('https://evil.example.org', { kind: 'login', username: 'u', password: 'geheim', origin: 'https://login.example.com' });
+    ok(fp.r === false && fp.value === undefined, 'fillPage füllt nichts, wenn die Origin nicht mehr stimmt');
+    const fp2 = runFillPage('https://login.example.com', { kind: 'login', username: 'u', password: 'geheim', origin: 'https://login.example.com' });
+    ok(fp2.r === true && fp2.value === 'geheim', 'fillPage füllt bei passender Origin');
+
+    // Speichern-Abfrage: URL kommt vom Browser, nicht aus der Nachricht
+    await raw('submitted', { url: 'https://login.example.com/', username: 'bob', password: 'untergeschoben' }, { id: 'rwid', url: 'https://evil.example.org/', tab: tabsById[13] });
+    await new Promise((r) => setTimeout(r, 300));
+    const pend = (await call('list', {})).pending;
+    ok(!pend || pend.host === 'evil.example.org', 'Speichern-Abfrage nutzt die echte Seiten-URL');
+    if (pend) await call('pendingDismiss');
+
+    // Passive Befehle verlängern den Sperr-Timer nicht
+    await new Promise((r) => setTimeout(r, 100)); // Timer-Neustart des vorigen Befehls läuft nebenher
+    delete alarms.lock;
+    await call('totp', { id });
+    await call('totp', { id });
+    await call('status');
+    ok(!alarms.lock, 'TOTP-Countdown/Status halten den Tresor nicht offen');
+    await call('list', {});
+    await new Promise((r) => setTimeout(r, 100));
+    ok(!!alarms.lock, 'echte Nutzung verlängert den Timer');
+
+    // Passkey-Optionen werden bereinigt, nur eine offene Anfrage pro Tab
+    const big = { ...opts, rp: { id: 'example.net', name: 'X' }, user: { id: 'dQ', name: 'A'.repeat(100000) }, junk: 'B'.repeat(100000) };
+    const p1 = await raw('pkBegin', { kind: 'create', options: big }, WEB);
+    const p2 = await raw('pkBegin', { kind: 'create', options: big }, WEB);
+    const pkKeys = Object.keys(browser.storage.session.d).filter((k) => k.startsWith('pk:'));
+    ok(p1.reqId && p2.reqId && pkKeys.length === 1 && pkKeys[0] === 'pk:' + p2.reqId, 'nur eine offene Passkey-Anfrage pro Tab');
+    ok(JSON.stringify(browser.storage.session.d).length < 20000, 'Passkey-Optionen der Seite werden gekürzt/bereinigt');
+    await raw('pkFinish', { reqId: p2.reqId, action: 'cancel' }, FRAME);
+    await raw('pkResult', { reqId: p2.reqId }, WEB);
+    ok((await raw('pkBegin', { kind: 'create', options: { ...opts, rp: { id: 'example.net' }, challenge: 'kein base64!' } }, WEB)).fallback, 'ungültige Challenge → Safari übernimmt');
+    await call('remove', { id: vn });
+    await call('remove', { id: vn });
+    await call('remove', { id: shop });
+    await call('remove', { id: shop });
   }
 
   console.log('Passkeys');
@@ -297,6 +409,11 @@ async function register(w, email, password, kdf) {
   ok(stored.length === 1 && stored[0].rpId === 'example.net' && stored[0].userName === 'carol' && pkItem.login.password === 'pw-neu', 'nach Sync: Passkey am Eintrag, Passwort unverändert');
   ok(!Object.values(browser.storage.local.d).some((v) => typeof v === 'string' && v.includes(stored[0].keyValue)), 'privater Schlüssel liegt nur verschlüsselt vor');
   ok((await raw('pkBegin', { kind: 'create', options: { ...createOpts, excludeCredentials: [c1.id] } }, WEB)).error === 'InvalidStateError', 'excludeCredentials: bereits registriert');
+  const b5 = await raw('pkBegin', { kind: 'create', options: { ...createOpts, rp: { id: 'neu.example.net', name: 'Sub' } } }, WEB);
+  const i5 = await raw('pkInfo', { reqId: b5.reqId }, FRAME);
+  ok(i5.ok && !i5.choices.some((c) => c.id === i1.choices[0].id), 'Passkey einer anderen rpId wird nicht zum Ersetzen angeboten');
+  ok((await raw('pkFinish', { reqId: b5.reqId, action: 'confirm', choice: i1.choices[0].id }, FRAME)).ok === false, '… und kann auch nicht erzwungen ersetzt werden');
+  await raw('pkResult', { reqId: b5.reqId }, WEB);
 
   const chal2 = nc.randomBytes(32).toString('base64url');
   const b2 = await raw('pkBegin', { kind: 'get', options: { rpId: 'example.net', challenge: chal2, allowCredentials: [c1.id] } }, WEB);
@@ -321,11 +438,14 @@ async function register(w, email, password, kdf) {
   }
 
   console.log('Sperren / PIN');
+  await fails(call('setPin', { pin: '4711', persist: true }), /8 Zeichen/, 'dauerhafte PIN braucht mindestens 8 Zeichen');
   await call('setPin', { pin: '4711' });
+  ok(!Object.keys(browser.storage.local.d).some((k) => k.endsWith(':pin')), 'PIN-Schlüssel standardmäßig nicht auf der Festplatte');
   await call('lock');
   ok((await call('status')).state === 'locked' && (await call('status')).hasPin, 'gesperrt, PIN vorhanden');
   await fails(call('list', {}), /gesperrt/, 'gesperrt: kein Zugriff');
   await fails(call('unlockPin', { pin: '0000' }), /Falsche PIN/, 'falsche PIN');
+  ok(Object.keys(browser.storage.local.d).some((k) => k.endsWith(':pinFail')), 'Fehlversuche werden dauerhaft gezählt (Neustart setzt nicht zurück)');
   await call('unlockPin', { pin: '4711' });
   ok((await call('get', { id })).item.login.password === 'zweites', 'mit PIN entsperrt');
   await call('lock');
@@ -333,6 +453,10 @@ async function register(w, email, password, kdf) {
   await call('unlock', { password: A.password });
   ok((await call('status')).state === 'unlocked', 'mit Master-Passwort entsperrt');
   await fails(call('bioEnable'), /Native Komponente/, 'Touch ID ohne native Seite: saubere Fehlermeldung');
+  await call('setPin', { pin: 'lange-pin-123', persist: true });
+  ok(Object.keys(browser.storage.local.d).some((k) => k.endsWith(':pin')) && (await call('status')).hasPin, 'dauerhafte PIN auf ausdrücklichen Wunsch');
+  await call('clearPin');
+  ok(!(await call('getSettings')).hasPin, 'PIN entfernt');
 
   console.log('Papierkorb / Export / Import');
   await call('remove', { id });
@@ -357,6 +481,11 @@ async function register(w, email, password, kdf) {
   ok(st.accounts.length === 2 && st.email === B.email, 'zwei Konten, B aktiv');
   await call('switchAccount', { id: st.accounts.find((a) => a.email === A.email).id });
   ok((await call('get', { id })).item.name === 'Beispiel ✓', 'zurück zu Konto A – noch entsperrt, eigene Daten');
+  await call('lock');
+  await call('switchAccount', { id: st.accounts.find((a) => a.email === B.email).id });
+  ok((await call('status')).state === 'locked', 'manuelles Sperren sperrt auch das andere Konto');
+  await call('switchAccount', { id: st.accounts.find((a) => a.email === A.email).id });
+  await call('unlock', { password: A.password });
   await browser.alarms.onAlarm.fns[0]({ name: 'lock' });
   ok((await call('status')).state === 'locked', 'Timer sperrt');
   await call('logout');

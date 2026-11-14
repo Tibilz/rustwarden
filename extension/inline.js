@@ -2,6 +2,7 @@
 'use strict';
 (async () => {
   const list = document.getElementById('list');
+  const token = location.hash.slice(1);
   const tell = (m) => parent.postMessage(m, '*');
   const div = (cls, text) => {
     const d = document.createElement('div');
@@ -11,7 +12,7 @@
   };
   let r;
   try {
-    r = await browser.runtime.sendMessage({ cmd: 'inlineList' });
+    r = await browser.runtime.sendMessage({ cmd: 'inlineList', token });
   } catch {
     r = null;
   }
@@ -30,7 +31,7 @@
       row.append(div('sub', it.sub || ''));
       row.onclick = () => {
         tell({ rw: 'close' });
-        browser.runtime.sendMessage({ cmd: 'inlineFill', id: it.id }).catch(() => {});
+        browser.runtime.sendMessage({ cmd: 'inlineFill', id: it.id, token }).catch(() => {});
       };
       list.append(row);
     }

@@ -1,6 +1,9 @@
 #!/bin/zsh
-# Baut den WASM-Kern und die Safari-App (ad-hoc signiert, für lokale Nutzung).
-#   ./build.sh           normaler Build
+# Baut den WASM-Kern und die Safari-App.
+#   ./build.sh           normaler Build (ad-hoc signiert; Safari braucht „Nicht signierte Erweiterungen erlauben“)
+#   RW_TEAM=ABCDE12345 ./build.sh
+#                        mit deinem Apple-Development-Zertifikat signieren (auch kostenloses Apple-ID-Team);
+#                        die Erweiterung bleibt dann über Safari-Neustarts hinweg aktiv
 #   ./build.sh --regen   Xcode-Projekt neu erzeugen (nötig, wenn Dateien in extension/ hinzukommen;
 #                        setzt eigene Signatur-Einstellungen im Projekt zurück)
 set -euo pipefail
@@ -26,9 +29,13 @@ fi
 cp native/SafariWebExtensionHandler.swift "$PROJ/RustWarden Extension/SafariWebExtensionHandler.swift"
 
 echo "==> Safari-App bauen"
+if [[ -n "${RW_TEAM:-}" ]]; then
+  SIGN=(CODE_SIGN_STYLE=Automatic DEVELOPMENT_TEAM="$RW_TEAM" -allowProvisioningUpdates)
+else
+  SIGN=(CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=)
+fi
 xcodebuild -project $PROJ/RustWarden.xcodeproj -scheme RustWarden \
   -configuration Release -derivedDataPath build \
-  CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= \
-  build -quiet
+  "${SIGN[@]}" build -quiet
 
 echo "==> Fertig: build/Build/Products/Release/RustWarden.app"

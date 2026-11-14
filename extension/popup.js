@@ -148,7 +148,11 @@ function el(tag, props, ...kids) {
 
 async function send(cmd, extra) {
   const r = await browser.runtime.sendMessage({ cmd, ...(extra || {}) });
-  if (!r || !r.ok) throw new Error((r && r.error) || 'Keine Antwort vom Hintergrundprozess');
+  if (!r || !r.ok) {
+    const e = new Error((r && r.error) || 'Keine Antwort vom Hintergrundprozess');
+    e.code = r && r.code;
+    throw e;
+  }
   return r;
 }
 
@@ -537,7 +541,7 @@ async function viewMain(reload = true) {
           p.kind === 'update' ? `Passwort für „${p.name}“ aktualisieren?` : `Login für ${p.host} speichern?`,
           p.username && el('div', { class: 'muted small' }, p.username),
         ),
-        el('button', { class: 'primary', onclick: busy(null, async () => (await send('pendingAccept'), toast('Gespeichert'), viewMain())) }, 'Speichern'),
+        el('button', { class: 'primary', onclick: busy(null, async () => (await send('pendingAccept', { ts: p.ts }), toast('Gespeichert'), viewMain())) }, 'Speichern'),
         el('button', { title: 'Für diese Seite nie anbieten', onclick: busy(null, async () => (await send('neverDomain'), toast(`${p.host} ausgeschlossen`), viewMain())) }, 'Nie'),
         el('button', { title: 'Jetzt nicht', onclick: busy(null, async () => (await send('pendingDismiss'), viewMain())) }, '✕'),
       ),
@@ -671,7 +675,14 @@ async function doFill(it) {
   try {
     if (!(await guard(it))) return;
     if (!tab) throw new Error('Kein aktiver Tab');
-    const r = await send('fill', { id: it.id, tabId: tab.id });
+    let r;
+    try {
+      r = await send('fill', { id: it.id, tabId: tab.id, url: tab.url });
+    } catch (e) {
+      if (e.code !== 'insecure') throw e;
+      if (!confirm('Diese Seite nutzt eine unverschlüsselte Verbindung (http), der Eintrag ist für https gespeichert. Trotzdem ausfüllen?')) return;
+      r = await send('fill', { id: it.id, tabId: tab.id, url: tab.url, allowHttp: true });
+    }
     if (!r.filled) return toast('Keine passenden Felder gefunden');
     const autoCopy = !data || !data.settings || data.settings.autoCopyTotp !== false;
     if (r.totp && autoCopy) await copy(r.totp, 'Ausgefüllt – TOTP-Code');
@@ -1397,6 +1408,7 @@ async function viewSettings() {
   const again = async (msg) => (toast(msg), viewSettings());
 
   const pinInput = el('input', { type: 'password', placeholder: 'Neue PIN (mind. 4 Zeichen)', autocomplete: 'off' });
+  const pinPersist = el('input', { type: 'checkbox' });
   const folderName = el('input', { type: 'text', placeholder: 'Neuer Ordner' });
   const srvName = (srv) => (!srv ? '' : srv.region === 'self' ? srv.base : srv.region === 'eu' ? 'bitwarden.eu' : 'bitwarden.com');
   const syncInfo = el('span', { class: 'muted small' }, r.lastSync ? `Zuletzt: ${new Date(r.lastSync).toLocaleString('de-DE')}` : 'Noch nie');
@@ -1442,7 +1454,19 @@ async function viewSettings() {
       el('label', {}, 'Entsperren mit PIN'),
       r.hasPin
         ? act('PIN entfernen', async () => (await send('clearPin'), again('PIN entfernt')))
-        : el('div', { class: 'inline' }, pinInput, act('Festlegen', async () => (await send('setPin', { pin: pinInput.value }), again('PIN festgelegt')))),
+        : el(
+            'div',
+            {},
+            el('div', { class: 'inline' }, pinInput, act('Festlegen', async () => (await send('setPin', { pin: pinInput.value, persist: pinPersist.checked }), again('PIN festgelegt')))),
+            el('label', { class: 'check' }, pinPersist, 'Auch nach Browser-Neustart (PIN ab 8 Zeichen)'),
+          ),
+      el(
+        'p',
+        { class: 'muted small hint' },
+        r.hasPin && r.pinPersist
+          ? 'Die PIN ist dauerhaft gespeichert. Wer Zugriff auf deine Dateien hat, kann sie offline durchprobieren.'
+          : 'Standard: Nach einem Browser-Neustart ist einmal das Master-Passwort nötig. Dauerhaft gespeichert ist der PIN-geschützte Schlüssel offline angreifbar.',
+      ),
       el('label', {}, 'Entsperren mit Touch ID'),
       r.hasBio
         ? act('Touch ID deaktivieren', async () => (await send('bioDisable'), again('Touch ID deaktiviert')))
@@ -1598,6 +1622,7 @@ async function start() {
     } catch {}
     data = null;
     tab = null;
+    verified.clear();
     if (!inTab) {
       try {
         [tab] = await browser.tabs.query({ active: true, currentWindow: true });
@@ -1623,6 +1648,8 @@ async function start() {
 browser.runtime.onMessage.addListener((m) => {
   // Nach Hintergrund-Sync die Liste aktualisieren, falls sie gerade sichtbar ist.
   if (m && m.evt === 'synced' && app.querySelector('.chips')) viewMain().catch(() => {});
+  // Gesperrt/abgemeldet (Timer, anderes Fenster): angezeigte Daten sofort verwerfen.
+  if (m && m.evt === 'locked') start();
 });
 
 start();

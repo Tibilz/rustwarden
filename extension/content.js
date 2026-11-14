@@ -33,10 +33,12 @@
     }
     say({ cmd: 'submitted', url: location.href, username, password: pw.value });
   };
-  addEventListener('submit', (e) => grab(e.target), true);
+  // Nur echte Nutzeraktionen (isTrusted): eine Seite soll keine Speichern-Abfragen fälschen können.
+  addEventListener('submit', (e) => e.isTrusted && grab(e.target), true);
   addEventListener(
     'keydown',
     (e) => {
+      if (!e.isTrusted) return;
       if (e.key === 'Escape') close();
       else if (e.key === 'Enter' && e.target && e.target.type === 'password') grab(e.target.form);
     },
@@ -45,6 +47,7 @@
   addEventListener(
     'click',
     (e) => {
+      if (!e.isTrusted) return;
       const b = e.target && e.target.closest && e.target.closest('button,input[type=submit],[role=button]');
       if (b) grab(b.form);
     },
@@ -115,11 +118,21 @@
     if (frame) frame.remove();
     frame = null;
   }
-  function open(t) {
+  // Einmal-Token pro Menü: nur von uns geöffnete iframes erhalten Zugriff (keine fremden iframes,
+  // die inline.html selbst einbetten).
+  async function open(t) {
+    close();
+    const token = [...crypto.getRandomValues(new Uint8Array(16))].map((b) => b.toString(16).padStart(2, '0')).join('');
+    try {
+      await browser.runtime.sendMessage({ cmd: 'inlineToken', token });
+    } catch {
+      return;
+    }
+    if (document.activeElement !== t) return;
     close();
     const r = t.getBoundingClientRect();
     frame = document.createElement('iframe');
-    frame.src = browser.runtime.getURL('inline.html');
+    frame.src = browser.runtime.getURL('inline.html') + '#' + token;
     const w = Math.max(240, Math.min(r.width, 380));
     frame.style.cssText =
       'position:fixed;z-index:2147483647;border:1px solid rgba(128,128,128,.5);border-radius:8px;' +

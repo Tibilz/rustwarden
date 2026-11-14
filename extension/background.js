@@ -32,6 +32,10 @@ const DEFAULTS = {
 const EXT = browser.runtime.getURL('');
 
 const L = browser.storage.local;
+// Sitzungsschlüssel nicht für Content-Scripts lesbar machen (Standard in Chrome; in Safari explizit setzen).
+try {
+  browser.storage.session?.setAccessLevel?.({ accessLevel: 'TRUSTED_CONTEXTS' })?.catch?.(() => {});
+} catch {}
 const mem = {};
 const S = browser.storage.session || {
   get: async (k) => ({ [k]: mem[k] }),
@@ -72,7 +76,26 @@ function core() {
   return (wasmReady ??= fetch(browser.runtime.getURL('wasm/rw_core_bg.wasm'))
     .then((r) => r.arrayBuffer())
     .then((buf) => wasm_bindgen({ module_or_path: buf }))
-    .then(() => wasm_bindgen));
+    .then(() => guardCore(wasm_bindgen)));
+}
+
+// Nach einem WebAssembly-Trap (z. B. Speicherüberlauf) ist der Zustand des Moduls unbestimmt:
+// beim nächsten Aufruf frisch instanziieren statt die kaputte Instanz weiterzuverwenden.
+function guardCore(w) {
+  return new Proxy(w, {
+    get(t, k) {
+      const f = t[k];
+      if (typeof f !== 'function') return f;
+      return (...a) => {
+        try {
+          return f(...a);
+        } catch (e) {
+          if (e instanceof WebAssembly.RuntimeError) wasmReady = null;
+          throw e;
+        }
+      };
+    },
+  });
 }
 
 // ---------- Helfer ----------
@@ -102,7 +125,15 @@ const b64url = (b) => b.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '
 
 function serverBase(server) {
   const b = String(server.base || '').trim().replace(/\/+$/, '');
-  if (!/^https?:\/\//i.test(b)) throw new Error('Server-URL muss mit https:// beginnen');
+  let u;
+  try {
+    u = new URL(b);
+  } catch {
+    throw new Error('Ungültige Server-URL');
+  }
+  const local = ['localhost', '127.0.0.1', '[::1]'].includes(u.hostname);
+  if (u.protocol !== 'https:' && !(u.protocol === 'http:' && local)) throw new Error('Server-URL muss mit https:// beginnen');
+  if (u.username || u.password) throw new Error('Server-URL darf keine Zugangsdaten enthalten');
   return b;
 }
 
@@ -210,7 +241,10 @@ async function login(m) {
     p = { server: m.server, email, kdf, masterKey: k.masterKey, hash: k.hash, ts: Date.now() };
   } else {
     p = await sget('pendingLogin');
-    if (!p) throw new Error('Anmeldung abgelaufen, bitte erneut beginnen');
+    if (!p || Date.now() - p.ts > 600000) {
+      await S.remove('pendingLogin');
+      throw new Error('Anmeldung abgelaufen, bitte erneut beginnen');
+    }
   }
 
   const form = {
@@ -223,7 +257,7 @@ async function login(m) {
     deviceIdentifier: await deviceId(),
     deviceName: 'safari',
   };
-  const remembered = ((await lget('remember')) || {})[p.email];
+  const remembered = ((await lget('remember')) || {})[accountId(p)];
   if (m.twoFactor) {
     form.twoFactorProvider = String(m.twoFactor.provider);
     form.twoFactorToken = String(m.twoFactor.token).replace(/\s+/g, '');
@@ -259,11 +293,11 @@ async function login(m) {
 
   if (b.twoFactorToken) {
     const r = (await lget('remember')) || {};
-    r[p.email] = b.twoFactorToken;
+    r[accountId(p)] = b.twoFactorToken;
     await L.set({ remember: r });
   }
   const prev = await aid();
-  const id = p.email + '|' + (p.server.region === 'self' ? serverBase(p.server) : p.server.region || 'us');
+  const id = accountId(p);
   const list = (await accountList()).filter((a) => a.id !== id);
   list.push({ id, email: p.email, server: p.server });
   activeId = id;
@@ -291,6 +325,8 @@ async function login(m) {
   return { step: 'done' };
 }
 
+const accountId = (p) => p.email + '|' + (p.server.region === 'self' ? serverBase(p.server) : p.server.region || 'us');
+
 async function sendEmailCode() {
   const p = await sget('pendingLogin');
   if (!p) throw new Error('Anmeldung abgelaufen');
@@ -309,9 +345,15 @@ async function needAccount() {
   return acc;
 }
 
+let refreshing = null;
 async function accessToken(force) {
   const acc = await needAccount();
   if (!force && Date.now() < acc.tokens.exp - 60000) return acc.tokens.access;
+  // Parallele Aufrufe teilen sich einen Refresh (sonst kann ein rotiertes Refresh-Token zum Logout führen).
+  return (refreshing ??= refreshToken(acc).finally(() => (refreshing = null)));
+}
+
+async function refreshToken(acc) {
   const res = await tokenRequest(acc.server, {
     grant_type: 'refresh_token',
     client_id: 'browser',
@@ -359,13 +401,20 @@ async function unlockWith(password) {
   return c.open_session(k.masterKey, JSON.stringify(await aget('profile')));
 }
 
-async function lock(all) {
+// Sperrt immer alle Konten – sonst bliebe ein anderes entsperrtes Konto ohne Sperr-Timer zurück.
+async function lock() {
   views = null;
-  if (all) for (const a of await accountList()) await S.remove('s:' + a.id);
-  else if (await aid()) await S.remove('s:' + (await aid()));
-  await S.remove('pendingSave');
+  for (const a of await accountList()) await S.remove('s:' + a.id);
+  await S.remove(['pendingSave', 'pendingLogin']);
   await browser.alarms.clear('lock');
   setBadge('');
+  notifyLocked();
+}
+
+function notifyLocked() {
+  try {
+    browser.runtime.sendMessage({ evt: 'locked' }).catch(() => {});
+  } catch {}
 }
 
 async function logout() {
@@ -374,14 +423,20 @@ async function logout() {
   if (id) {
     const all = await L.get(null);
     await L.remove(Object.keys(all).filter((k) => k.startsWith(`a:${id}:`)));
-    await S.remove('s:' + id);
+    await S.remove(['s:' + id, 'pin:' + id]);
     native({ cmd: 'bioDelete', account: id }).catch(() => {});
+    const r = (await lget('remember')) || {};
+    if (id in r) {
+      delete r[id];
+      await L.set({ remember: r });
+    }
   }
   const list = (await accountList()).filter((a) => a.id !== id);
   activeId = list.length ? list[0].id : '';
   await L.set({ accounts: list, active: activeId });
   await S.remove('pendingSave');
   setBadge('');
+  notifyLocked();
 }
 
 async function switchTo(id) {
@@ -413,32 +468,51 @@ async function pinKey(pin) {
   return c.stretch_key(JSON.parse(c.derive_keys(acc.email, 'pin:' + pin, JSON.stringify(acc.kdf))).masterKey);
 }
 
+// Standard wie bei Bitwarden: der PIN-geschützte Schlüssel liegt nur im Arbeitsspeicher
+// (storage.session) – nach einem Browser-Neustart ist das Master-Passwort nötig. Auf der Festplatte
+// (storage.local) nur auf ausdrücklichen Wunsch, dann mit längerer PIN, weil sie offline angreifbar ist.
+async function pinBlob() {
+  return (await aget('pin')) || (await sget('pin:' + (await aid())));
+}
+
+async function clearPin() {
+  await adel('pin');
+  await S.remove('pin:' + (await aid()));
+}
+
 async function setPin(m) {
   const session = await needSession();
-  if (!/^.{4,}$/.test(m.pin || '')) throw new Error('Die PIN braucht mindestens 4 Zeichen');
+  const persist = m.persist === true;
+  const min = persist ? 8 : 4;
+  if (typeof m.pin !== 'string' || m.pin.length < min) throw new Error(`Die PIN braucht mindestens ${min} Zeichen`);
   const c = await core();
-  await aset({ pin: c.text_encrypt(await pinKey(m.pin), session) });
+  const blob = c.text_encrypt(await pinKey(m.pin), session);
+  await clearPin();
+  if (persist) await aset({ pin: blob });
+  else await S.set({ ['pin:' + (await aid())]: blob });
+  await adel('pinFail');
   return {};
 }
 
 async function unlockPin(m) {
-  const blob = await aget('pin');
+  const blob = await pinBlob();
   if (!blob) throw new Error('Keine PIN eingerichtet');
   const c = await core();
-  const failKey = 'pinFail:' + (await aid());
   let session;
   try {
-    session = c.text_decrypt(await pinKey(m.pin || ''), blob);
+    session = c.text_decrypt(await pinKey(String(m.pin || '')), blob);
   } catch {
-    const n = ((await sget(failKey)) || 0) + 1;
-    await S.set({ [failKey]: n });
+    // Zähler auf der Festplatte: ein Browser-Neustart setzt ihn nicht zurück.
+    const n = ((await aget('pinFail')) || 0) + 1;
+    await aset({ pinFail: n });
     if (n >= 5) {
-      await adel('pin');
+      await clearPin();
+      await adel('pinFail');
       throw new Error('Zu viele Fehlversuche – PIN entfernt, bitte Master-Passwort verwenden');
     }
     throw new Error(`Falsche PIN (${5 - n} Versuche übrig)`);
   }
-  await S.remove(failKey);
+  await adel('pinFail');
   await afterUnlock(session);
   return {};
 }
@@ -829,21 +903,53 @@ async function importVault(m) {
 
 // ---------- URL-Abgleich ----------
 
-// Heuristik statt kompletter Public-Suffix-Liste (spart ~200 kB und Parse-Zeit).
-const SUFFIX2 = new Set(
-  (
-    'co.uk org.uk ac.uk gov.uk me.uk com.au net.au org.au co.nz co.jp ne.jp or.jp co.kr com.br com.mx com.ar ' +
-    'com.tr com.cn com.hk com.tw com.sg co.in co.za co.il com.pl com.ua co.at or.at gv.at com.es ' +
-    'github.io gitlab.io herokuapp.com netlify.app vercel.app pages.dev workers.dev web.app firebaseapp.com ' +
-    'azurewebsites.net cloudfront.net blogspot.com appspot.com fly.dev onrender.com'
-  ).split(' '),
-);
+// Public Suffix List (extension/psl.txt, aus tools/gen-psl.js). Wird erst beim ersten Abgleich geladen
+// und bleibt bis zum Entladen der Background-Page im Speicher.
+let PSL = null;
+let pslReady = null;
+function loadPsl() {
+  return (pslReady ??= fetch(browser.runtime.getURL('psl.txt'))
+    .then((r) => r.text())
+    .then((t) => {
+      const rules = new Set();
+      const wild = new Set();
+      const except = new Set();
+      for (const l of t.split('\n')) {
+        if (!l || l.startsWith('//')) continue;
+        if (l[0] === '!') except.add(l.slice(1));
+        else if (l.startsWith('*.')) wild.add(l.slice(2));
+        else rules.add(l);
+      }
+      PSL = { rules, wild, except };
+    })
+    .catch((e) => {
+      pslReady = null;
+      throw e;
+    }));
+}
 
-function baseDomain(host) {
-  if (/^[\d.]+$/.test(host) || host.includes(':') || !host.includes('.')) return host;
+// Öffentliches Suffix eines Hosts nach den PSL-Regeln (längste Regel gewinnt, Ausnahmen zuerst).
+function publicSuffix(host) {
+  if (!PSL) throw new Error('Suffixliste nicht geladen');
   const p = host.split('.');
-  const two = p.slice(-2).join('.');
-  return SUFFIX2.has(two) && p.length > 2 ? p.slice(-3).join('.') : two;
+  for (let i = 0; i < p.length; i++) {
+    const cand = p.slice(i).join('.');
+    if (PSL.except.has(cand)) return p.slice(i + 1).join('.');
+    if (PSL.rules.has(cand) || (i + 1 < p.length && PSL.wild.has(p.slice(i + 1).join('.')))) return cand;
+  }
+  return p[p.length - 1]; // Standardregel "*"
+}
+
+const isIp = (host) => /^[\d.]+$/.test(host) || host.includes(':') || host.startsWith('[');
+
+// Registrierbare Domain (eTLD+1). Hosts, die selbst ein öffentliches Suffix sind, bleiben unverändert.
+function baseDomain(host) {
+  host = host.replace(/\.$/, '');
+  if (isIp(host) || !host.includes('.')) return host;
+  const suf = publicSuffix(host);
+  if (suf === host) return host;
+  const p = host.split('.');
+  return p.slice(-(suf.split('.').length + 1)).join('.');
 }
 
 function parseUrl(u) {
@@ -868,6 +974,8 @@ function matcher(tabUrl, eq, defaultMatch = 0) {
         case 5:
           return false;
         case 4:
+          // Begrenzung gegen katastrophales Backtracking (ReDoS) bei langen URLs/Mustern.
+          if (u.uri.length > 500 || tabUrl.length > 2048) return false;
           try {
             return new RegExp(u.uri, 'i').test(tabUrl);
           } catch {
@@ -893,6 +1001,7 @@ function matcher(tabUrl, eq, defaultMatch = 0) {
 const byName = (a, b) => (b.favorite ? 1 : 0) - (a.favorite ? 1 : 0) || String(a.name).localeCompare(String(b.name));
 
 async function matchesFor(url) {
+  await loadPsl();
   const m = matcher(url, await aget('eq'), (await settings()).defaultMatch);
   return (await getViews()).ciphers.filter(m).sort(byName);
 }
@@ -998,14 +1107,17 @@ async function evalPending() {
   if (hit ? !st.updatePrompt : !st.addPrompt) return drop();
   setBadge('+');
   return hit
-    ? { kind: 'update', id: hit.id, name: hit.name, host, username: p.username }
-    : { kind: 'new', host, username: p.username };
+    ? { kind: 'update', id: hit.id, name: hit.name, host, username: p.username, ts: p.ts }
+    : { kind: 'new', host, username: p.username, ts: p.ts };
 }
 
-async function acceptPending() {
+// `ts` identifiziert die Abfrage, die das Popup angezeigt hat: wurde sie inzwischen (z. B. von einem
+// anderen Tab) ersetzt, wird nichts gespeichert.
+async function acceptPending(ts) {
   const p = await sget('pendingSave');
   const info = await evalPending();
   if (!p || !info) return {};
+  if (p.ts !== ts) throw new Error('Die Speichern-Abfrage hat sich geändert – bitte erneut prüfen');
   if (info.kind === 'update') {
     const v = structuredClone(await getView(info.id));
     v.login.password = p.password;
@@ -1086,12 +1198,14 @@ async function fillData(v) {
 
 // Wird in die Seite injiziert – muss vollständig in sich geschlossen sein.
 function fillPage(d) {
-  // Nur Top-Frame und same-origin-Frames befüllen (kein Abgreifen über fremde iframes).
+  // Nur Top-Frame und same-origin-Frames befüllen (kein Abgreifen über fremde iframes) – und nur,
+  // wenn die Seite noch dieselbe ist, für die der Eintrag ausgewählt wurde (Navigation dazwischen).
   try {
     if (window.top !== window) void window.top.location.href;
   } catch {
     return false;
   }
+  if (location.origin !== d.origin) return false;
   const visible = (e) => {
     const r = e.getBoundingClientRect();
     return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== 'hidden' && !e.disabled && !e.readOnly;
@@ -1160,9 +1274,31 @@ function fillPage(d) {
   return n > 0;
 }
 
-async function fill(id, tabId) {
-  const data = await fillData(await getView(id));
+// Zugangsdaten, die für https gespeichert sind, nicht in eine unverschlüsselte (http) Seite schreiben.
+function insecureFor(view, url) {
+  if (view.type !== 1 || !/^http:/i.test(url)) return false;
+  const uris = ((view.login && view.login.uris) || []).map((u) => u && u.uri).filter(Boolean);
+  return uris.some((u) => /^https:/i.test(u)) && !uris.some((u) => /^http:/i.test(u));
+}
+
+// `url`: Seite, für die der Eintrag ausgewählt wurde. Ausgefüllt wird nur in Frames mit genau dieser Origin.
+async function fill(id, tabId, url, { allowHttp = false } = {}) {
+  const view = await getView(id);
+  let origin;
+  try {
+    origin = new URL(url).origin;
+  } catch {
+    throw new Error('Unbekannte Seite');
+  }
+  if (!/^https?:/.test(origin)) throw new Error('Auf dieser Seite kann nicht ausgefüllt werden');
+  if (!allowHttp && insecureFor(view, url)) {
+    const e = new Error('Unverschlüsselte Verbindung (http) – Ausfüllen abgebrochen');
+    e.code = 'insecure';
+    throw e;
+  }
+  const data = await fillData(view);
   if (!data) throw new Error('Dieser Eintragstyp kann nicht ausgefüllt werden');
+  data.origin = origin;
   let res;
   try {
     res = await browser.scripting.executeScript({ target: { tabId, allFrames: true }, func: fillPage, args: [data] });
@@ -1180,7 +1316,7 @@ async function autofillTab(tab) {
   }
   const m = (await suggestionsFor(tab.url)).list.filter((v) => v.reprompt !== 1);
   if (m.length) {
-    await fill(m[0].id, tab.id);
+    await fill(m[0].id, tab.id, tab.url).catch(() => browser.action.openPopup());
     await touch();
   } else {
     await browser.action.openPopup();
@@ -1230,8 +1366,13 @@ function derSig(raw) {
   return new Uint8Array([0x30, r.length + s.length, ...r, ...s]);
 }
 // rpId muss zum Host gehören und darf kein bloßes Suffix oberhalb der registrierbaren Domain sein.
+// Zusätzlich: keine Hosts mit Schlusspunkt, keine IP-Adressen (außer 127.0.0.1) und kein öffentliches Suffix.
 function rpIdOk(rpId, host) {
+  if (typeof rpId !== 'string' || !rpId || rpId.endsWith('.') || host.endsWith('.')) return false;
+  if (isIp(host) && host !== '127.0.0.1') return false;
+  if (host === 'localhost' || host === '127.0.0.1') return rpId === host;
   const base = baseDomain(host);
+  if (base === publicSuffix(host)) return false;
   return (host === rpId || host.endsWith('.' + rpId)) && (rpId === base || rpId.endsWith('.' + base));
 }
 
@@ -1249,6 +1390,32 @@ async function passkeysFor(rpId, allow) {
   return out;
 }
 
+// Nur bekannte, typgeprüfte und größenbegrenzte Felder der WebAuthn-Optionen übernehmen –
+// die Seite kontrolliert sie vollständig.
+const B64U = /^[A-Za-z0-9_-]*={0,2}$/;
+function cleanOpts(kind, o) {
+  const str = (v, max) => (typeof v === 'string' && v.length <= max ? v : undefined);
+  const id = (v, max = 1024) => (typeof v === 'string' && v.length <= max && B64U.test(v) ? v : undefined);
+  // passkey-page.js liefert Credential-IDs als base64url-Strings
+  const creds = (l) => (Array.isArray(l) ? l.slice(0, 64).map((c) => id(c)).filter(Boolean) : undefined);
+  const challenge = id(o.challenge, 2048);
+  if (!challenge) return null;
+  if (kind === 'get')
+    return { challenge, rpId: str(o.rpId, 253), allowCredentials: creds(o.allowCredentials), userVerification: str(o.userVerification, 20) };
+  const user = o.user || {};
+  const rp = o.rp || {};
+  return {
+    challenge,
+    rp: { id: str(rp.id, 253), name: str(rp.name, 256) },
+    user: { id: id(user.id, 128), name: str(user.name, 256), displayName: str(user.displayName, 256) },
+    pubKeyCredParams: Array.isArray(o.pubKeyCredParams)
+      ? o.pubKeyCredParams.slice(0, 32).map((p) => ({ type: p && p.type, alg: p && p.alg })).filter((p) => typeof p.alg === 'number')
+      : [],
+    excludeCredentials: creds(o.excludeCredentials),
+    credProps: o.credProps === true,
+  };
+}
+
 async function pkBegin(m, sender) {
   if ((await settings()).passkeys === false || !(await aid())) return { fallback: true };
   let url;
@@ -1260,10 +1427,11 @@ async function pkBegin(m, sender) {
   const local = url.hostname === 'localhost' || url.hostname === '127.0.0.1';
   if (url.protocol !== 'https:' && !local) return { fallback: true };
   const kind = m.kind === 'create' ? 'create' : 'get';
-  const o = m.options || {};
-  const rpId = String((kind === 'create' ? o.rp && o.rp.id : o.rpId) || url.hostname).toLowerCase();
+  const o = cleanOpts(kind, m.options && typeof m.options === 'object' ? m.options : {});
+  if (!o) return { fallback: true };
+  const rpId = String((kind === 'create' ? o.rp.id : o.rpId) || url.hostname).toLowerCase();
+  await loadPsl();
   if (!rpIdOk(rpId, url.hostname)) return { error: 'SecurityError' };
-  if (typeof o.challenge !== 'string') return { fallback: true };
   if (await getSession()) {
     if (kind === 'create') {
       if (!(o.pubKeyCredParams || []).some((p) => p.type === 'public-key' && p.alg === -7)) return { fallback: true };
@@ -1272,6 +1440,9 @@ async function pkBegin(m, sender) {
     } else if (!(await passkeysFor(rpId, o.allowCredentials)).length) return { fallback: true };
   }
   const reqId = crypto.randomUUID();
+  // Höchstens eine offene Anfrage pro Tab: ältere verwerfen (verhindert Volllaufen des Speichers).
+  const old = Object.entries(await S.get(null)).filter(([k, v]) => k.startsWith('pk:') && v && v.tabId === sender.tab.id);
+  if (old.length) await S.remove(old.map(([k]) => k));
   await S.set({ ['pk:' + reqId]: { kind, rpId, origin: url.origin, tabId: sender.tab.id, tabUrl: url.href, options: o, ts: Date.now() } });
   return { reqId };
 }
@@ -1288,7 +1459,7 @@ async function pkInfo(m, sender) {
   if (!(await getSession())) return { ...base, locked: true };
   if (req.kind === 'create') {
     const choices = (await matchesFor(req.tabUrl))
-      .filter((v) => v.reprompt !== 1 && v.edit !== false)
+      .filter((v) => v.reprompt !== 1 && v.edit !== false && sameRpOnly(v, req.rpId))
       .map((v) => ({ id: v.id, name: v.name || '', sub: subtitle(v), has: !!(v.login.fido2Credentials || []).length }));
     return { ...base, userName: req.options.user.name || req.options.user.displayName || '', choices };
   }
@@ -1299,6 +1470,9 @@ async function pkInfo(m, sender) {
   }));
   return { ...base, choices };
 }
+
+// Ein vorhandener Passkey darf nur durch einen für dieselbe rpId ersetzt werden.
+const sameRpOnly = (v, rpId) => (v.login.fido2Credentials || []).every((c) => c && c.rpId === rpId);
 
 async function pkCreate(req, choice) {
   const o = req.options;
@@ -1334,7 +1508,9 @@ async function pkCreate(req, choice) {
     creationDate: new Date().toISOString(),
   };
   if (choice && choice !== 'new') {
-    const allowed = (await matchesFor(req.tabUrl)).some((v) => v.id === choice && v.reprompt !== 1);
+    const allowed = (await matchesFor(req.tabUrl)).some(
+      (v) => v.id === choice && v.reprompt !== 1 && v.edit !== false && sameRpOnly(v, req.rpId),
+    );
     if (!allowed) throw new Error('Eintrag passt nicht zu dieser Seite');
     const view = structuredClone(await getView(choice));
     view.login.removeFido2 = true; // ein Passkey pro Eintrag – der neue ersetzt einen vorhandenen
@@ -1415,7 +1591,8 @@ const handlers = {
       email: acc.email,
       active: await aid(),
       accounts,
-      hasPin: !!(await aget('pin')),
+      hasPin: !!(await pinBlob()),
+      pinPersist: !!(await aget('pin')),
       hasBio: !!(await aget('bio')),
     };
   },
@@ -1433,7 +1610,7 @@ const handlers = {
   unlockBio,
   setPin,
   async clearPin() {
-    await adel('pin');
+    await clearPin();
     return {};
   },
   bioEnable,
@@ -1447,7 +1624,7 @@ const handlers = {
     return {};
   },
   async lock() {
-    await lock(false);
+    await lock();
     return {};
   },
   async logout() {
@@ -1489,11 +1666,12 @@ const handlers = {
     return { totp: await totpFor(await getView(m.id)) };
   },
   async fill(m) {
-    const r = await fill(m.id, m.tabId);
-    if (r.filled) {
-      const t = await browser.tabs.get(m.tabId).catch(() => null);
-      if (t && t.url) await rememberHost(t.url, m.id).catch(() => {});
-    }
+    // Die Seite muss noch die sein, die das Popup angezeigt hat.
+    const t = await browser.tabs.get(m.tabId).catch(() => null);
+    const url = (t && t.url) || m.url;
+    if (!url || (m.url && new URL(m.url).origin !== new URL(url).origin)) throw new Error('Die Seite hat sich geändert');
+    const r = await fill(m.id, m.tabId, url, { allowHttp: m.allowHttp === true });
+    if (r.filled) await rememberHost(url, m.id).catch(() => {});
     return r;
   },
   async forgetHost(m) {
@@ -1533,8 +1711,8 @@ const handlers = {
     const c = await core();
     return { value: c.generate(JSON.stringify(m.opts || {})) };
   },
-  async pendingAccept() {
-    return acceptPending();
+  async pendingAccept(m) {
+    return acceptPending(m.ts);
   },
   async neverDomain() {
     const p = await sget('pendingSave');
@@ -1568,7 +1746,8 @@ const handlers = {
       account: acc && { email: acc.email, server: acc.server },
       active: await aid(),
       accounts: (await accountList()).map((a) => ({ id: a.id, email: a.email, server: a.server })),
-      hasPin: !!(await aget('pin')),
+      hasPin: !!(await pinBlob()),
+      pinPersist: !!(await aget('pin')),
       hasBio: !!(await aget('bio')),
       rememberedHosts: Object.keys(await hostMap()).length,
     };
@@ -1585,6 +1764,7 @@ const handlers = {
   },
   // --- aus dem Inline-Menü (iframe in der Webseite) ---
   async inlineList(m, sender) {
+    await inlineAuth(m, sender);
     if (!(await getSession())) return { locked: true, items: [] };
     const items = (await suggestionsFor(sender.tab.url)).list
       .filter((v) => v.reprompt !== 1)
@@ -1592,10 +1772,11 @@ const handlers = {
     return { items };
   },
   async inlineFill(m, sender) {
+    await inlineAuth(m, sender);
     // Nur Einträge, die zur Seite des Tabs passen – das iframe kann nichts anderes anfordern.
     const ok = (await matchesFor(sender.tab.url)).some((v) => v.id === m.id && v.reprompt !== 1);
     if (!ok) throw new Error('Eintrag passt nicht zu dieser Seite');
-    const r = await fill(m.id, sender.tab.id);
+    const r = await fill(m.id, sender.tab.id, sender.tab.url);
     if (r.filled) await rememberHost(sender.tab.url, m.id).catch(() => {});
     return r;
   },
@@ -1606,9 +1787,18 @@ const handlers = {
   pkInfo,
   pkFinish,
 };
+// Inline-Menü: Token, das unser Content-Script im Top-Frame des Tabs vergeben hat (5 Minuten gültig).
+async function inlineAuth(m, sender) {
+  const t = await sget('inl:' + sender.tab.id);
+  if (!t || typeof m.token !== 'string' || t.token !== m.token || Date.now() - t.ts > 300000) throw new Error('Nicht erlaubt');
+}
+
 // Befehle, die unsere iframes innerhalb von Webseiten senden dürfen – und nur diese.
 const FRAME_ONLY = new Set(['inlineList', 'inlineFill', 'pkInfo', 'pkFinish']);
 const FRAME_CMDS = new Set([...FRAME_ONLY, 'openPopup']);
+// Befehle, die keine Nutzeraktivität bedeuten und daher den Sperr-Timer nicht verlängern
+// (z. B. der TOTP-Countdown eines offenen Eintrags oder ein in die Seite eingebettetes Menü).
+const PASSIVE = new Set(['lock', 'logout', 'status', 'totp', 'inlineList', 'pkInfo', 'openPopup', 'getSettings']);
 
 function excluded(url, list) {
   let host;
@@ -1620,13 +1810,15 @@ function excluded(url, list) {
   return (list || []).some((d) => host === d || host.endsWith('.' + d));
 }
 
-async function onSubmitted(m) {
+async function onSubmitted(m, sender) {
   const st = await settings();
   if ((!st.addPrompt && !st.updatePrompt) || !(await aid())) return;
-  if (typeof m.password !== 'string' || !m.password || !/^https?:/.test(m.url || '')) return;
-  if (excluded(m.url, st.neverDomains)) return;
+  // URL vom Browser, nicht aus der Nachricht.
+  const url = sender.url || (sender.tab && sender.tab.url) || '';
+  if (typeof m.password !== 'string' || !m.password || m.password.length > 1000 || !/^https?:/.test(url)) return;
+  if (excluded(url, st.neverDomains)) return;
   await S.set({
-    pendingSave: { url: m.url, username: String(m.username || ''), password: m.password, ts: Date.now() },
+    pendingSave: { url, username: String(m.username || '').slice(0, 500), password: m.password, ts: Date.now() },
   });
   if (await getSession()) await evalPending().catch(() => {});
 }
@@ -1638,7 +1830,7 @@ async function onLoginPage(sender) {
   const m = (await suggestionsFor(sender.tab.url)).list;
   if (s.badge) setBadge(m.length ? String(m.length) : '', sender.tab.id);
   const usable = m.filter((v) => v.reprompt !== 1);
-  if (s.autoFill && usable.length && /^https:/.test(sender.tab.url || '')) await fill(usable[0].id, sender.tab.id);
+  if (s.autoFill && usable.length && /^https:/.test(sender.tab.url || '')) await fill(usable[0].id, sender.tab.id, sender.tab.url);
 }
 
 browser.runtime.onMessage.addListener((m, sender, respond) => {
@@ -1652,7 +1844,11 @@ browser.runtime.onMessage.addListener((m, sender, respond) => {
       (m.cmd === 'pkBegin' ? pkBegin : pkResult)(m, sender).then(respond, () => respond({ fallback: true }));
       return true;
     }
-    if (m.cmd === 'submitted') onSubmitted(m).catch(() => {});
+    if (m.cmd === 'inlineToken' && !sender.frameId && typeof m.token === 'string' && m.token.length <= 64) {
+      S.set({ ['inl:' + sender.tab.id]: { token: m.token, ts: Date.now() } }).then(() => respond({}), () => respond({}));
+      return true;
+    }
+    if (m.cmd === 'submitted') onSubmitted(m, sender).catch(() => {});
     else if (m.cmd === 'loginPage') onLoginPage(sender).catch(() => {});
     return;
   }
@@ -1665,10 +1861,10 @@ browser.runtime.onMessage.addListener((m, sender, respond) => {
   (async () => {
     try {
       const r = (await fn(m, sender)) || {};
-      if (m.cmd !== 'lock' && (await getSession())) touch().catch(() => {});
+      if (!PASSIVE.has(m.cmd) && (await getSession())) touch().catch(() => {});
       respond({ ok: true, ...r });
     } catch (e) {
-      respond({ ok: false, error: String((e && e.message) || e) });
+      respond({ ok: false, error: String((e && e.message) || e), code: (e && e.code) || undefined });
     }
   })();
   return true;
@@ -1684,7 +1880,7 @@ async function logoutAll() {
 browser.alarms.onAlarm.addListener(async (a) => {
   if (a.name === 'lock') {
     if ((await settings()).timeoutAction === 'logout') await logoutAll();
-    else await lock(true);
+    else await lock();
   }
   else if (a.name === 'clip') {
     const hash = await sget('clip');

@@ -53,6 +53,9 @@ pub fn totp(input: &str, now: u64) -> R<Value> {
                 _ => {}
             }
         }
+        if lower.starts_with("otpauth://hotp/") {
+            return Err("HOTP (zählerbasiert) wird nicht unterstützt".into());
+        }
         if lower.starts_with("otpauth://steam/") {
             steam = true;
         }
@@ -68,7 +71,8 @@ pub fn totp(input: &str, now: u64) -> R<Value> {
     let h = match algo.as_str() {
         "SHA256" => mac!(sha2::Sha256, &key, &msg),
         "SHA512" => mac!(sha2::Sha512, &key, &msg),
-        _ => mac!(sha1::Sha1, &key, &msg),
+        "SHA1" => mac!(sha1::Sha1, &key, &msg),
+        a => return Err(format!("Unbekannter TOTP-Algorithmus {a}")),
     };
     let off = (h[h.len() - 1] & 0x0f) as usize;
     let mut bin = u32::from_be_bytes([h[off], h[off + 1], h[off + 2], h[off + 3]]) & 0x7fff_ffff;

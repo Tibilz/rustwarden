@@ -174,17 +174,17 @@ mod tests {
     #[test]
     fn kdf_normalizes_email_as_salt() {
         // E-Mail wird getrimmt und kleingeschrieben als Salt verwendet.
-        let kdf = json!({ "kdf": 0, "kdfIterations": 5000 });
+        let kdf = json!({ "kdf": 0, "kdfIterations": 100000 });
         let (mk, _) = crypto::derive(" User@Example.com", "password", &kdf).unwrap();
         let mut expect = [0u8; 32];
-        pbkdf2::pbkdf2_hmac::<sha2::Sha256>(b"password", b"user@example.com", 5000, &mut expect);
+        pbkdf2::pbkdf2_hmac::<sha2::Sha256>(b"password", b"user@example.com", 100000, &mut expect);
         assert_eq!(mk, expect);
     }
 
     #[test]
     fn full_roundtrip_personal_and_org() {
         for kdf in [
-            json!({ "kdf": 0, "kdfIterations": 1000 }),
+            json!({ "kdf": 0, "kdfIterations": 100000 }),
             json!({ "kdf": 1, "kdfIterations": 2, "kdfMemory": 16, "kdfParallelism": 2 }),
         ] {
             let (mk, user, protected) = account("hunter2", &kdf);
@@ -245,6 +245,106 @@ mod tests {
             assert_eq!(out["ciphers"][2]["decryptError"], true);
             assert_eq!(out["folders"][0]["name"], "Privat");
         }
+    }
+
+    fn test_session() -> vault::Session {
+        let mut raw = [0u8; 64];
+        crypto::random(&mut raw).unwrap();
+        vault::Session { user: Key::from_bytes(&raw).unwrap(), orgs: Default::default() }
+    }
+
+    #[test]
+    fn server_cannot_inject_plaintext() {
+        // Ein bösartiger Server ersetzt verschlüsselte Felder durch Klartext → muss auffallen.
+        let s = test_session();
+        let view = json!({ "type": 1, "name": "Bank", "login": { "username": "bob", "password": "pw",
+                           "uris": [{ "uri": "https://bank.example", "match": null }] } });
+        let enc = vault::encrypt_cipher(&s, &view, &Value::Null).unwrap();
+        let mut evil = enc.clone();
+        evil["login"]["uris"][0]["uri"] = json!("https://evil.example");
+        evil["login"]["uris"][0]["uriChecksum"] = Value::Null;
+        evil["login"]["injected"] = json!("Klartext");
+        let mut forged = json!({ "id": "f", "name": "Gefälscht", "login": { "password": "x" } });
+        forged["type"] = json!(1);
+        let out = vault::decrypt_vault(&s, &json!({ "ciphers": [evil, forged] }));
+        let c = &out["ciphers"][0];
+        assert_eq!(c["decryptError"], true);
+        assert!(c["login"]["uris"][0]["uri"].is_null(), "Klartext-URI darf nicht übernommen werden");
+        assert!(c["login"].get("injected").is_none(), "unbekannte Felder werden verworfen");
+        assert_eq!(c["login"]["password"], "pw");
+        assert_eq!(out["ciphers"][1]["decryptError"], true);
+        assert!(out["ciphers"][1]["login"]["password"].is_null());
+    }
+
+    #[test]
+    fn uri_checksum_is_verified() {
+        // Server vertauscht die (gültig verschlüsselte) URI eines anderen Eintrags → Prüfsumme passt nicht.
+        let s = test_session();
+        let mk = |uri: &str| {
+            vault::encrypt_cipher(&s, &json!({ "type": 1, "name": "x", "login": { "uris": [{ "uri": uri }] } }), &Value::Null)
+                .unwrap()
+        };
+        let (a, b) = (mk("https://bank.example"), mk("https://evil.example"));
+        let mut swapped = a.clone();
+        swapped["login"]["uris"][0]["uri"] = b["login"]["uris"][0]["uri"].clone();
+        let out = vault::decrypt_vault(&s, &json!({ "ciphers": [a, swapped] }));
+        assert_eq!(out["ciphers"][0]["login"]["uris"][0]["uri"], "https://bank.example");
+        assert!(out["ciphers"][0].get("decryptError").is_none());
+        assert!(out["ciphers"][1]["login"]["uris"][0]["uri"].is_null());
+        assert_eq!(out["ciphers"][1]["decryptError"], true);
+    }
+
+    #[test]
+    fn encrypt_never_sends_plaintext() {
+        // Import mit Zahlen und unbekannten Feldern: alles Geheime wird verschlüsselt, Unbekanntes verworfen.
+        let s = test_session();
+        let card = json!({ "type": 3, "name": "Karte", "card": { "number": 4111111111111111u64, "code": 123,
+                           "expYear": 2027, "extra": { "secret": "plain" } },
+                           "fields": [{ "type": 1, "name": "PIN", "value": 4321 }] });
+        let r = vault::encrypt_cipher(&s, &card, &Value::Null).unwrap();
+        let text = r.to_string();
+        for leak in ["4111111111111111", "4321", "plain", "\"code\":123", "2027"] {
+            assert!(!text.contains(leak), "Klartext {leak} im Request: {text}");
+        }
+        assert_eq!(r["fields"][0]["type"], 1, "Feldtyp bleibt Klartext-Metadatum");
+        let out = vault::decrypt_vault(&s, &json!({ "ciphers": [r] }));
+        assert_eq!(out["ciphers"][0]["card"]["number"], "4111111111111111");
+        assert_eq!(out["ciphers"][0]["fields"][0]["value"], "4321");
+        let login = json!({ "type": 1, "name": "x", "login": { "password": "p", "newFido2Credentials": [], "removeFido2": true } });
+        let r = vault::encrypt_cipher(&s, &login, &Value::Null).unwrap();
+        assert!(r["login"].get("removeFido2").is_none() && r["login"].get("newFido2Credentials").is_none());
+    }
+
+    #[test]
+    fn kdf_bounds_enforced() {
+        let bad = [
+            json!({ "kdf": 0, "kdfIterations": 1 }),
+            json!({ "kdf": 0, "kdfIterations": 4294967297u64 }),
+            json!({ "kdf": 0, "kdfIterations": 4000000000u64 }),
+            json!({ "kdf": 0, "kdfIterations": 600000.5 }),
+            json!({ "kdf": 0, "kdfIterations": -5 }),
+            json!({ "kdf": 1, "kdfIterations": 1, "kdfMemory": 64, "kdfParallelism": 4 }),
+            json!({ "kdf": 1, "kdfIterations": 3, "kdfMemory": 4194305, "kdfParallelism": 4 }),
+            json!({ "kdf": 1, "kdfIterations": 3, "kdfMemory": 4096, "kdfParallelism": 4 }),
+            json!({ "kdf": 1, "kdfIterations": 3, "kdfMemory": 64, "kdfParallelism": 0 }),
+            json!({ "kdf": 2 }),
+        ];
+        for k in bad {
+            assert!(crypto::derive("a@b.c", "pw", &k).is_err(), "akzeptiert: {k}");
+        }
+        assert!(crypto::derive("a@b.c", "pw", &json!({ "kdf": 0, "kdfIterations": 100000 })).is_ok());
+    }
+
+    #[test]
+    fn generator_min_counts_are_bounded() {
+        let pw = gen::password(&json!({ "length": 10, "minNumbers": 1e15, "minSpecial": 4000000000u64 })).unwrap();
+        assert_eq!(pw.chars().count(), 10);
+    }
+
+    #[test]
+    fn totp_rejects_unsupported() {
+        assert!(totp::totp("otpauth://hotp/x?secret=GEZDGNBV&counter=1", 59).is_err());
+        assert!(totp::totp("otpauth://totp/x?secret=GEZDGNBV&algorithm=MD5", 59).is_err());
     }
 
     #[test]

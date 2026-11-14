@@ -61,37 +61,116 @@ pub fn open_session(master_key: &[u8], profile: &Value) -> R<Session> {
     Ok(Session { user, orgs })
 }
 
-fn looks_enc(s: &str) -> bool {
-    let b = s.as_bytes();
-    b.len() > 20
-        && b[0].is_ascii_digit()
-        && b[1] == b'.'
-        && s.contains('|')
-        && b[2..].iter().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'/' | b'=' | b'|'))
+/// Feldschema der Bitwarden-Einträge: (verschlüsselte Felder, Klartext-Metadaten).
+/// Alles andere wird verworfen – so kann ein Server weder Klartext in verschlüsselte Felder
+/// schmuggeln noch unbekannte Felder unterschieben.
+pub const LOGIN: (&[&str], &[&str]) =
+    (&["username", "password", "totp", "uri"], &["passwordRevisionDate", "autofillOnPageLoad", "uris", "fido2Credentials"]);
+pub const URI: (&[&str], &[&str]) = (&["uri", "uriChecksum"], &["match"]);
+pub const FIDO: (&[&str], &[&str]) = (
+    &["credentialId", "keyType", "keyAlgorithm", "keyCurve", "keyValue", "rpId", "userHandle", "userName",
+      "counter", "rpName", "userDisplayName", "discoverable"],
+    &["creationDate"],
+);
+pub const FIELD: (&[&str], &[&str]) = (&["name", "value"], &["type", "linkedId"]);
+pub const HIST: (&[&str], &[&str]) = (&["password"], &["lastUsedDate"]);
+pub const ATTACH: (&[&str], &[&str]) = (&["fileName"], &["id", "url", "size", "sizeName", "key", "object"]);
+pub const CARD: (&[&str], &[&str]) = (&["cardholderName", "brand", "number", "expMonth", "expYear", "code"], &[]);
+pub const IDENTITY: (&[&str], &[&str]) = (
+    &["title", "firstName", "middleName", "lastName", "address1", "address2", "address3", "city", "state",
+      "postalCode", "country", "company", "email", "phone", "ssn", "username", "passportNumber", "licenseNumber"],
+    &[],
+);
+pub const SSH: (&[&str], &[&str]) = (&["privateKey", "publicKey", "keyFingerprint"], &[]);
+pub const NOTE: (&[&str], &[&str]) = (&[], &["type"]);
+
+/// Ein verschlüsseltes Feld: null bleibt null, sonst muss es ein gültiger EncString mit Text sein.
+fn dec(v: &mut Value, key: &Key, bad: &mut bool) {
+    let ok = match v {
+        Value::Null => return,
+        Value::String(s) if s.is_empty() => return,
+        Value::String(s) => crypto::decrypt(s, key).ok().and_then(|b| String::from_utf8(b).ok()),
+        _ => None,
+    };
+    match ok {
+        Some(t) => *v = Value::String(t),
+        None => {
+            *bad = true;
+            *v = Value::Null;
+        }
+    }
 }
 
-/// Entschlüsselt rekursiv alle EncStrings in einem JSON-Wert.
-/// Binäre Inhalte (z. B. Anhang-Schlüssel) bleiben verschlüsselt stehen.
-fn walk(v: &mut Value, key: &Key, bad: &mut bool) {
+/// Entschlüsselt ein Unterobjekt nach Schema; fehlt es (null), bleibt es null.
+fn dec_obj(v: &mut Value, key: &Key, bad: &mut bool, (enc, plain): (&[&str], &[&str])) {
+    if v.is_null() {
+        return;
+    }
+    let Some(o) = v.as_object_mut() else {
+        *bad = true;
+        *v = Value::Null;
+        return;
+    };
+    o.retain(|k, _| enc.contains(&k.as_str()) || plain.contains(&k.as_str()));
+    for k in enc {
+        if let Some(x) = o.get_mut(*k) {
+            dec(x, key, bad);
+        }
+    }
+}
+
+fn dec_list(v: &mut Value, key: &Key, bad: &mut bool, schema: (&[&str], &[&str])) {
     match v {
-        Value::String(s) => {
-            if looks_enc(s) {
-                match crypto::decrypt(s, key) {
-                    Ok(b) => {
-                        if let Ok(t) = String::from_utf8(b) {
-                            *s = t;
+        Value::Null => {}
+        Value::Array(a) => a.iter_mut().for_each(|x| dec_obj(x, key, bad, schema)),
+        _ => {
+            *bad = true;
+            *v = Value::Null;
+        }
+    }
+}
+
+/// Entschlüsselt einen Eintrag nach dem Bitwarden-Schema. Anhang-Schlüssel bleiben verschlüsselt.
+fn walk(c: &mut Value, key: &Key, bad: &mut bool) {
+    let Some(o) = c.as_object_mut() else {
+        *bad = true;
+        return;
+    };
+    o.remove("data"); // veraltete Doppelung der Felder, wird nicht verwendet
+    for k in ["name", "notes"] {
+        if let Some(x) = o.get_mut(k) {
+            dec(x, key, bad);
+        }
+    }
+    for (k, schema) in [("card", CARD), ("identity", IDENTITY), ("sshKey", SSH), ("secureNote", NOTE)] {
+        if let Some(x) = o.get_mut(k) {
+            dec_obj(x, key, bad, schema);
+        }
+    }
+    for (k, schema) in [("fields", FIELD), ("passwordHistory", HIST), ("attachments", ATTACH)] {
+        if let Some(x) = o.get_mut(k) {
+            dec_list(x, key, bad, schema);
+        }
+    }
+    if let Some(l) = o.get_mut("login") {
+        dec_obj(l, key, bad, LOGIN);
+        if let Some(lo) = l.as_object_mut() {
+            if let Some(u) = lo.get_mut("uris") {
+                dec_list(u, key, bad, URI);
+                // Prüfsumme wie in den offiziellen Clients: verhindert vertauschte/untergeschobene URIs.
+                for x in u.as_array_mut().into_iter().flatten() {
+                    if let (Some(uri), Some(sum)) = (x["uri"].as_str(), x["uriChecksum"].as_str()) {
+                        if b64(&Sha256::digest(uri.as_bytes())) != sum {
+                            *bad = true;
+                            x["uri"] = Value::Null;
                         }
-                    }
-                    Err(_) => {
-                        *bad = true;
-                        *v = Value::Null;
                     }
                 }
             }
+            if let Some(f) = lo.get_mut("fido2Credentials") {
+                dec_list(f, key, bad, FIDO);
+            }
         }
-        Value::Array(a) => a.iter_mut().for_each(|x| walk(x, key, bad)),
-        Value::Object(o) => o.values_mut().for_each(|x| walk(x, key, bad)),
-        _ => {}
     }
 }
 
@@ -175,12 +254,23 @@ fn enc_s(v: &Value, key: &Key) -> R<Value> {
     }
 }
 
-/// Verschlüsselt alle String-Felder eines Objekts (außer `skip`), Rest wird übernommen.
-fn enc_all(o: &Value, key: &Key, skip: &[&str]) -> R<Map<String, Value>> {
+/// Verschlüsselt ein Objekt nach Schema: Felder aus `enc` (Zahlen/Wahrheitswerte als Text),
+/// Felder aus `plain` unverändert; alles andere wird verworfen, damit nie Klartext zum Server geht.
+fn enc_all(o: &Value, key: &Key, (enc, plain): (&[&str], &[&str])) -> R<Map<String, Value>> {
     let mut out = Map::new();
     if let Some(m) = o.as_object() {
         for (k, v) in m {
-            let val = if v.is_string() && !skip.contains(&k.as_str()) { enc_s(v, key)? } else { v.clone() };
+            let val = if enc.contains(&k.as_str()) {
+                match v {
+                    Value::Number(n) => enc_s(&Value::String(n.to_string()), key)?,
+                    Value::Bool(b) => enc_s(&Value::String(b.to_string()), key)?,
+                    _ => enc_s(v, key)?,
+                }
+            } else if plain.contains(&k.as_str()) {
+                v.clone()
+            } else {
+                continue;
+            };
             out.insert(k.clone(), val);
         }
     }
@@ -223,22 +313,19 @@ pub fn encrypt_cipher(s: &Session, view: &Value, orig: &Value) -> R<Value> {
 
     let mut fields = Vec::new();
     for f in view["fields"].as_array().into_iter().flatten() {
-        fields.push(Value::Object(enc_all(f, key, &[])?));
+        fields.push(Value::Object(enc_all(f, key, FIELD)?));
     }
     r.insert("fields".into(), if fields.is_empty() { Value::Null } else { Value::Array(fields) });
 
     let mut hist = Vec::new();
     for h in view["passwordHistory"].as_array().into_iter().flatten() {
-        hist.push(Value::Object(enc_all(h, key, &["lastUsedDate"])?));
+        hist.push(Value::Object(enc_all(h, key, HIST)?));
     }
     r.insert("passwordHistory".into(), if hist.is_empty() { Value::Null } else { Value::Array(hist) });
 
     match ty {
         1 => {
-            let mut l = enc_all(&view["login"], key, &["passwordRevisionDate"])?;
-            // Steuerfelder der Oberfläche – dürfen nie (im Klartext) im Request landen.
-            l.remove("newFido2Credentials");
-            l.remove("removeFido2");
+            let mut l = enc_all(&view["login"], key, LOGIN)?;
             let mut uris = Vec::new();
             for u in view["login"]["uris"].as_array().into_iter().flatten() {
                 let Some(uri) = u["uri"].as_str().filter(|x| !x.is_empty()) else { continue };
@@ -258,7 +345,7 @@ pub fn encrypt_cipher(s: &Session, view: &Value, orig: &Value) -> R<Value> {
                 orig["login"]["fido2Credentials"].as_array().cloned().unwrap_or_default()
             };
             for c in view["login"]["newFido2Credentials"].as_array().into_iter().flatten() {
-                fido.push(Value::Object(enc_all(c, key, &["creationDate"])?));
+                fido.push(Value::Object(enc_all(c, key, FIDO)?));
             }
             l.insert("fido2Credentials".into(), if fido.is_empty() { Value::Null } else { Value::Array(fido) });
             r.insert("login".into(), Value::Object(l));
@@ -267,13 +354,13 @@ pub fn encrypt_cipher(s: &Session, view: &Value, orig: &Value) -> R<Value> {
             r.insert("secureNote".into(), json!({ "type": 0 }));
         }
         3 => {
-            r.insert("card".into(), Value::Object(enc_all(&view["card"], key, &[])?));
+            r.insert("card".into(), Value::Object(enc_all(&view["card"], key, CARD)?));
         }
         4 => {
-            r.insert("identity".into(), Value::Object(enc_all(&view["identity"], key, &[])?));
+            r.insert("identity".into(), Value::Object(enc_all(&view["identity"], key, IDENTITY)?));
         }
         5 => {
-            r.insert("sshKey".into(), Value::Object(enc_all(&view["sshKey"], key, &[])?));
+            r.insert("sshKey".into(), Value::Object(enc_all(&view["sshKey"], key, SSH)?));
         }
         n => return Err(format!("Unbekannter Eintragstyp {n}")),
     }
