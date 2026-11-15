@@ -342,6 +342,17 @@ mod tests {
     }
 
     #[test]
+    fn generator_custom_special_chars() {
+        for _ in 0..50 {
+            let pw = gen::password(&json!({ "length": 13, "upper": true, "lower": false, "numbers": true,
+                                             "special": true, "specialChars": "#-#é a1" })).unwrap();
+            assert_eq!(pw.chars().count(), 13);
+            assert!(pw.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '#' || c == '-'), "{pw}");
+            assert!(pw.contains(|c: char| c == '#' || c == '-'));
+        }
+    }
+
+    #[test]
     fn totp_rejects_unsupported() {
         assert!(totp::totp("otpauth://hotp/x?secret=GEZDGNBV&counter=1", 59).is_err());
         assert!(totp::totp("otpauth://totp/x?secret=GEZDGNBV&algorithm=MD5", 59).is_err());

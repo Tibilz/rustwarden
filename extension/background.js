@@ -27,8 +27,9 @@ const DEFAULTS = {
   rememberHost: true, // zuletzt verwendeten Login pro Host merken
   quickCopy: true,
   showCards: false,
-  showIdentities: false,
+  showIdentities: true,
   theme: 'system', // 'system' | 'light' | 'dark'
+  v: 2, // Version der Einstellungen (für einmalige Umstellungen)
 };
 const EXT = browser.runtime.getURL('');
 
@@ -194,6 +195,12 @@ async function settings() {
   const st = { ...DEFAULTS, ...saved, _set: saved };
   // Frühere Version hatte nur einen Schalter für beide Speicher-Angebote.
   if (st.savePrompt === false && !('addPrompt' in st._set)) st.addPrompt = st.updatePrompt = false;
+  // v2: Identitäten werden (wie bei Bitwarden) standardmäßig im Popup angeboten – auch für alle,
+  // die den alten Standard „aus“ gespeichert haben. Danach gilt die eigene Wahl.
+  if (!(saved.v >= 2)) {
+    st.showIdentities = true;
+    st.v = 2;
+  }
   delete st._set;
   delete st.savePrompt;
   return st;
@@ -414,6 +421,7 @@ async function lock() {
   await browser.alarms.clear('lock');
   setBadge('');
   notifyLocked();
+  scheduleMenus();
 }
 
 function notifyLocked() {
@@ -442,6 +450,7 @@ async function logout() {
   await S.remove('pendingSave');
   setBadge('');
   notifyLocked();
+  scheduleMenus();
 }
 
 async function switchTo(id) {
@@ -451,6 +460,7 @@ async function switchTo(id) {
   await L.set({ active: id });
   await S.remove('pendingSave');
   setBadge('');
+  scheduleMenus();
 }
 
 async function touch() {
@@ -552,6 +562,7 @@ async function unlockBio() {
 async function afterUnlock(session) {
   await setSession(session);
   views = null;
+  scheduleMenus();
   await touch();
   syncInBackground();
 }
@@ -584,6 +595,7 @@ async function sync() {
     lastSync: Date.now(),
   });
   views = null;
+  scheduleMenus();
 }
 
 function syncInBackground() {
@@ -621,6 +633,7 @@ async function patchVault(fn) {
   fn(vault);
   await aset({ vault: JSON.stringify(vault) });
   views = null;
+  scheduleMenus();
 }
 
 function upsert(vault, cipher) {
@@ -1178,6 +1191,7 @@ async function fillData(v) {
     return {
       kind: 'rules',
       rules: [
+        ['honorific-prefix', 'salutation|anrede|^title|prefix', i.title],
         ['given-name', 'first.?name|vorname|given', i.firstName],
         ['additional-name', 'middle', i.middleName],
         ['family-name', 'last.?name|nachname|surname|family', i.lastName],
@@ -1903,24 +1917,63 @@ browser.commands.onCommand.addListener((cmd) => {
     .catch(() => {});
 });
 
-function setupMenus() {
-  try {
-    browser.contextMenus
-      .removeAll()
-      .then(() =>
-        browser.contextMenus.create({ id: 'fill', title: 'RustWarden: Login ausfüllen', contexts: ['editable', 'page'] }),
-      )
-      .catch(() => {});
-  } catch {}
+// Kontextmenü: Login ausfüllen, dazu – nur solange entsperrt – Untermenüs mit Identitäten und Karten
+// (wie bei Bitwarden). Namen der Einträge erscheinen also nie im Menü, solange der Tresor gesperrt ist.
+let menuTimer = null;
+function scheduleMenus() {
+  clearTimeout(menuTimer);
+  menuTimer = setTimeout(() => setupMenus().catch(() => {}), 150);
 }
-browser.runtime.onInstalled.addListener(setupMenus);
-browser.runtime.onStartup.addListener(setupMenus);
+
+async function setupMenus() {
+  if (!browser.contextMenus) return;
+  const make = (o) =>
+    new Promise((res) => {
+      try {
+        browser.contextMenus.create(o, () => res());
+      } catch {
+        res();
+      }
+    });
+  let groups = [];
+  if (await getSession().catch(() => null)) {
+    const all = (await getViews().catch(() => ({ ciphers: [] }))).ciphers.filter((v) => !v.deletedDate).sort(byName);
+    groups = [
+      ['identity', 'RustWarden: Identität ausfüllen', all.filter((v) => v.type === 4)],
+      ['card', 'RustWarden: Karte ausfüllen', all.filter((v) => v.type === 3)],
+    ].filter((g) => g[2].length);
+  }
+  await browser.contextMenus.removeAll();
+  await make({ id: 'fill', title: 'RustWarden: Login ausfüllen', contexts: ['editable', 'page'] });
+  for (const [kind, title, items] of groups) {
+    await make({ id: kind, title, contexts: ['editable', 'page'] });
+    for (const v of items.slice(0, 25)) {
+      const sub = subtitle(v);
+      const label = (v.name || '(ohne Namen)') + (sub && sub !== v.name ? ' – ' + sub : '');
+      await make({ id: `${kind}:${v.id}`, parentId: kind, title: label.slice(0, 60), contexts: ['editable', 'page'] });
+    }
+  }
+}
+
+// Identität/Karte aus dem Kontextmenü ausfüllen. Einträge mit Master-Passwort-Abfrage → Popup.
+async function fillFromMenu(id, tab) {
+  if (!tab) return;
+  if (!(await getSession())) return browser.action.openPopup();
+  const v = await getView(id);
+  if (v.reprompt === 1 || (v.type !== 3 && v.type !== 4)) return browser.action.openPopup();
+  await fill(id, tab.id, tab.url);
+  await touch();
+}
+browser.runtime.onInstalled.addListener(scheduleMenus);
+browser.runtime.onStartup.addListener(scheduleMenus);
 // Nach einem Browser-Neustart sind die Sitzungen weg – bei Timeout-Aktion „Abmelden“ heißt das: abmelden.
 browser.runtime.onStartup.addListener(async () => {
   if ((await settings()).timeoutAction === 'logout') await logoutAll().catch(() => {});
 });
 if (browser.contextMenus) {
   browser.contextMenus.onClicked.addListener((info, tab) => {
-    if (info.menuItemId === 'fill') autofillTab(tab).catch(() => {});
+    const mid = String(info.menuItemId);
+    if (mid === 'fill') autofillTab(tab).catch(() => {});
+    else if (/^(identity|card):/.test(mid)) fillFromMenu(mid.slice(mid.indexOf(':') + 1), tab).catch(() => {});
   });
 }

@@ -42,7 +42,18 @@ pub fn password(o: &Value) -> R<String> {
         sets.push((strip("0123456789"), o["minNumbers"].as_u64().unwrap_or(1).clamp(1, len as u64) as usize));
     }
     if flag(o, "special", true) {
-        sets.push((b"!@#$%^&*".to_vec(), o["minSpecial"].as_u64().unwrap_or(1).clamp(1, len as u64) as usize));
+        // Eigene Sonderzeichen (z. B. vom alten Passwort übernommen): nur druckbares ASCII ohne
+        // Buchstaben/Ziffern, ohne Duplikate; sonst die Standardauswahl.
+        let mut custom: Vec<u8> = o["specialChars"]
+            .as_str()
+            .unwrap_or("")
+            .bytes()
+            .filter(|c| c.is_ascii_graphic() && !c.is_ascii_alphanumeric())
+            .collect();
+        custom.sort_unstable();
+        custom.dedup();
+        let special = if custom.is_empty() { b"!@#$%^&*".to_vec() } else { custom };
+        sets.push((special, o["minSpecial"].as_u64().unwrap_or(1).clamp(1, len as u64) as usize));
     }
     if sets.is_empty() {
         sets.push((strip("abcdefghijklmnopqrstuvwxyz"), 1));

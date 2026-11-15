@@ -31,8 +31,9 @@ The goal is a client that costs almost nothing while you are not using it:
   "remember this device"; new-device verification
 - Vault: logins, cards, identities, secure notes, SSH keys (view only); folders, favorites,
   custom fields, password history, trash and restore; creating items inside organizations
-- Autofill for logins (including TOTP), cards and identities via popup, keyboard shortcut
-  (⌘⇧L) or context menu
+- Autofill for logins (including TOTP) via popup, keyboard shortcut (⌘⇧L) or context menu;
+  personal data (identities) and cards via popup or the context menus "Identität ausfüllen" /
+  "Karte ausfüllen"
 - Offer to save new or changed logins
 - Passkeys (WebAuthn, ES256): create, store in the vault, sign in
 - Attachments: upload, download, delete
@@ -107,6 +108,7 @@ the extension can reach it too.
 cd core && cargo test --release
 node tests/crypto-interop.test.js # WASM core vs. Node.js crypto (needs extension/wasm from ./build.sh)
 node tests/popup-render.test.js   # popup rendering and TOTP auto-copy, no browser needed
+node tests/background-offline.test.js # background script without a server: context menus, identity fill
 ```
 
 The end-to-end test needs a **throwaway** Vaultwarden with open registration. It creates two

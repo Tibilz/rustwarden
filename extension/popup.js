@@ -938,10 +938,13 @@ function viewEdit(orig) {
             class: 'icon',
             title: 'Generieren',
             onclick: () =>
-              viewGenerator((val) => {
-                inp.value = val;
-                inp.type = 'text';
-              }),
+              viewGenerator(
+                (val) => {
+                  inp.value = val;
+                  inp.type = 'text';
+                },
+                key === 'password' ? obj[key] || inp.value : null,
+              ),
           },
           icon('dice'),
         ),
@@ -1099,7 +1102,36 @@ function viewEdit(orig) {
 
 // ---------- Generator ----------
 
-function viewGenerator(onUse) {
+// Regeln eines vorhandenen Passworts: Länge, Zeichenarten und genau die verwendeten Sonderzeichen.
+// Der Inhalt des alten Passworts fließt nicht ein – das neue ist vollständig zufällig.
+function rulesOf(pw) {
+  const chars = [...pw];
+  const special = [...new Set(chars.filter((c) => /[!-\/:-@\[-`{-~]/.test(c)))].join('');
+  return {
+    type: 'password',
+    length: Math.min(128, Math.max(5, chars.length)),
+    upper: /[A-Z]/.test(pw),
+    lower: /[a-z]/.test(pw),
+    numbers: /[0-9]/.test(pw),
+    special: !!special,
+    specialChars: special,
+    avoidAmbiguous: false,
+  };
+}
+
+function describeRules(r) {
+  return [
+    `${r.length} Zeichen`,
+    r.upper && 'A–Z',
+    r.lower && 'a–z',
+    r.numbers && '0–9',
+    r.special && 'Sonderzeichen ' + r.specialChars,
+  ]
+    .filter(Boolean)
+    .join(' · ');
+}
+
+function viewGenerator(onUse, oldPassword) {
   const prev = [...app.childNodes];
   const prevTimer = timer;
   timer = null;
@@ -1113,12 +1145,17 @@ function viewGenerator(onUse) {
   } catch {}
   const out = el('div', { class: 'out mono' }, '…');
   const opts = el('div');
+  // „Vom alten Passwort ableiten“: nur im Eintrag mit vorhandenem Passwort; wird nicht gespeichert.
+  const derived = oldPassword ? rulesOf(String(oldPassword)) : null;
+  let derive = false;
   const gen = async () => {
+    if (!derive) {
+      try {
+        localStorage.setItem('gen', JSON.stringify(o));
+      } catch {}
+    }
     try {
-      localStorage.setItem('gen', JSON.stringify(o));
-    } catch {}
-    try {
-      out.textContent = (await send('generate', { opts: o })).value;
+      out.textContent = (await send('generate', { opts: derive ? derived : o })).value;
     } catch (e) {
       toast(e.message);
     }
@@ -1140,7 +1177,10 @@ function viewGenerator(onUse) {
     return [el('label', {}, label, ': ', val), r];
   };
   const drawOpts = () => {
-    if (o.type === 'username') {
+    type.disabled = derive;
+    if (derive) {
+      opts.replaceChildren(el('p', { class: 'muted small' }, 'Wie das alte Passwort: ', describeRules(derived)));
+    } else if (o.type === 'username') {
       const mode = el(
         'select',
         { value: o.mode || 'word', onchange: () => ((o.mode = mode.value), drawOpts(), gen()) },
@@ -1194,6 +1234,17 @@ function viewGenerator(onUse) {
         el('button', { onclick: () => copy(out.textContent, o.type === 'username' ? 'Benutzername' : 'Passwort') }, 'Kopieren'),
         onUse && el('button', { class: 'primary', onclick: () => (onUse(out.textContent), back()) }, 'Übernehmen'),
       ),
+      derived &&
+        el(
+          'label',
+          { class: 'check' },
+          el('input', {
+            type: 'checkbox',
+            onchange: (e) => ((derive = e.target.checked), drawOpts(), gen()),
+          }),
+          'Vom alten Passwort ableiten',
+        ),
+      derived && el('p', { class: 'muted small hint' }, 'Gleiche Länge und Zeichenarten wie das bisherige Passwort, Inhalt neu und zufällig – für Seiten mit strengen Passwortregeln.'),
       el('label', {}, 'Art'),
       type,
       opts,

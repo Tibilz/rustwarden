@@ -125,4 +125,15 @@ console.log('popup-render OK');
   await new Promise((r) => setTimeout(r, 20));
   if (bioCalls() !== 1) fail('Touch ID nach Abbruch erneut automatisch angefragt');
   console.log('touch-id-auto OK');
+
+  // „Vom alten Passwort ableiten“: nur Regeln, kein Inhalt
+  const rules = (pw) => JSON.parse(vm.runInContext(`JSON.stringify(rulesOf(${JSON.stringify(pw)}))`, ctx));
+  const r1 = rules('Sommer#2024xY');
+  if (!(r1.length === 13 && r1.upper && r1.lower && r1.numbers && r1.special && r1.specialChars === '#')) fail('Regeln falsch: ' + JSON.stringify(r1));
+  const r2 = rules('nur-kleine_buchstaben-');
+  if (!(r2.length === 22 && !r2.upper && r2.lower && !r2.numbers && r2.specialChars === '-_')) fail('Regeln falsch: ' + JSON.stringify(r2));
+  const r3 = rules('1234');
+  if (!(r3.length === 5 && r3.numbers && !r3.upper && !r3.lower && !r3.special)) fail('Mindestlänge/Ziffern falsch: ' + JSON.stringify(r3));
+  if (vm.runInContext("describeRules(rulesOf('Ab1#'))", ctx) !== '5 Zeichen · A–Z · a–z · 0–9 · Sonderzeichen #') fail('Beschreibung falsch');
+  console.log('derive-rules OK');
 })();

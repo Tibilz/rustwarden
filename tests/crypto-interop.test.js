@@ -224,6 +224,13 @@ function refDecrypt(enc, key) {
     }
     const exp = n / 10;
     const chi = Object.values(counts).reduce((a, v) => a + (v - exp) ** 2 / exp, 0);
+    // Abgeleitet vom alten Passwort „Sommer#2024xY“: 13 Zeichen, A–Z, a–z, 0–9, nur „#“
+    let okRules = true;
+    for (let i = 0; i < 100; i++) {
+      const d = W.generate(JSON.stringify({ type: 'password', length: 13, upper: true, lower: true, numbers: true, special: true, specialChars: '#', avoidAmbiguous: false }));
+      if (!(d.length === 13 && /^[A-Za-z0-9#]+$/.test(d) && /[A-Z]/.test(d) && /[a-z]/.test(d) && /\d/.test(d) && d.includes('#'))) okRules = false;
+    }
+    check('Abgeleitete Regeln werden eingehalten', okRules);
     check('Ziffern gleichverteilt (Chi² < 27.9, p=0.001)', Object.keys(counts).length === 10 && chi < 27.9, `chi²=${chi.toFixed(1)}`);
   }
 
