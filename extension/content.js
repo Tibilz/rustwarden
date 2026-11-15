@@ -1,4 +1,4 @@
-// Minimaler Content-Script (nur Top-Frame). Beim Laden passiert fast nichts:
+﻿// Minimaler Content-Script (nur Top-Frame). Beim Laden passiert fast nichts:
 // ein querySelector, dazu passive Listener. Alles Weitere erst bei Nutzerinteraktion.
 (() => {
   'use strict';

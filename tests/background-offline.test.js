@@ -126,6 +126,14 @@ const wait = (ms = 300) => new Promise((r) => setTimeout(r, ms));
   await wait();
   ok(menus.length === 1 && menus[0].id === 'fill', 'nach dem Sperren: Untermenüs entfernt');
 
+  // Skripte ohne eigene HTML-Seite (Hintergrund, Content-Script, Seiten-Brücke) brauchen ein UTF-8-BOM,
+  // sonst liest Safari sie nicht als UTF-8 und Umlaute in Menüs/Meldungen werden zu „Ã¼“.
+  for (const f of ['background.js', 'content.js', 'passkey-page.js']) {
+    const b = fs.readFileSync(path.join(DIR, f));
+    const ascii = b.every((x) => x < 0x80);
+    ok(ascii || (b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf), `${f}: UTF-8-BOM vorhanden (enthält Umlaute)`);
+  }
+
   console.log(`background-offline: ${n} OK`);
 })().catch((e) => {
   console.error(e);

@@ -1,4 +1,4 @@
-// RustWarden – Background (nicht persistent). Hält keinen dauerhaften Zustand im Speicher:
+﻿// RustWarden – Background (nicht persistent). Hält keinen dauerhaften Zustand im Speicher:
 // Schlüssel liegen in storage.session (nur RAM), der verschlüsselte Tresor in storage.local.
 // Der WASM-Kern wird erst geladen, wenn tatsächlich Kryptografie gebraucht wird.
 'use strict';

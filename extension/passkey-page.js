@@ -1,4 +1,4 @@
-// Läuft im Kontext der Webseite: fängt WebAuthn-Aufrufe ab und reicht sie an RustWarden weiter.
+﻿// Läuft im Kontext der Webseite: fängt WebAuthn-Aufrufe ab und reicht sie an RustWarden weiter.
 // Hat RustWarden nichts Passendes (oder ist die Funktion aus), läuft der Aufruf unverändert zu Safari durch.
 (() => {
   'use strict';
