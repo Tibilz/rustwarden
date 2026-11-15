@@ -23,6 +23,7 @@ const DEFAULTS = {
   autoFill: false,
   inline: false,
   passkeys: true,
+  bioAutoPrompt: true, // beim Öffnen des gesperrten Popups sofort nach Touch ID fragen
   rememberHost: true, // zuletzt verwendeten Login pro Host merken
   quickCopy: true,
   showCards: false,
@@ -205,7 +206,11 @@ async function native(msg) {
   } catch (e) {
     throw new Error('Native Komponente nicht erreichbar: ' + ((e && e.message) || e));
   }
-  if (!r || r.error) throw new Error((r && r.error) || 'Keine Antwort der nativen Komponente');
+  if (!r || r.error) {
+    const e = new Error((r && r.error) || 'Keine Antwort der nativen Komponente');
+    e.code = r && r.cancelled ? 'cancelled' : undefined;
+    throw e;
+  }
   return r;
 }
 
@@ -1594,6 +1599,7 @@ const handlers = {
       hasPin: !!(await pinBlob()),
       pinPersist: !!(await aget('pin')),
       hasBio: !!(await aget('bio')),
+      bioAuto: (await settings()).bioAutoPrompt !== false,
     };
   },
   login,

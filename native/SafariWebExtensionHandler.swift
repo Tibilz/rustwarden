@@ -43,7 +43,10 @@ class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling {
             ctx.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics,
                                localizedReason: "den RustWarden-Tresor entsperren") { ok, error in
                 guard ok else {
-                    done(["error": error?.localizedDescription ?? "Touch ID abgebrochen"])
+                    // Abbruch durch Nutzer/System/App: kein Fehler, den man anzeigen müsste.
+                    let code = (error as? LAError)?.code
+                    let cancelled = code == .userCancel || code == .systemCancel || code == .appCancel || code == .userFallback
+                    done(["error": error?.localizedDescription ?? "Touch ID abgebrochen", "cancelled": cancelled])
                     return
                 }
                 if let secret = self.keychainGet(account) {

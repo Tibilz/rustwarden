@@ -34,14 +34,17 @@ class Node {
   }
 }
 const app = new Node('div');
+const toastNode = new Node('div');
 const document = {
-  getElementById: (id) => (id === 'app' ? app : new Node('div')),
+  getElementById: (id) => (id === 'app' ? app : id === 'toast' ? toastNode : new Node('div')),
   createElement: (t) => new Node(t),
   body: new Node('body'),
 };
 const clipboard = [];
 let fillReply = null;
 let fills = 0;
+const sent = [];
+let bioReply = new Promise(() => {});
 const ctx = vm.createContext({
   document,
   location: { hash: '' },
@@ -57,6 +60,8 @@ const ctx = vm.createContext({
   browser: {
     runtime: {
       sendMessage: async (m) => {
+        sent.push(m.cmd);
+        if (m.cmd === 'unlockBio') return bioReply;
         if (m.cmd === 'fill') return fills++, fillReply;
         return m.cmd === 'copied' ? { ok: true } : new Promise(() => {});
       },
@@ -99,4 +104,25 @@ console.log('popup-render OK');
     }
   }
   console.log('auto-copy-totp OK');
+
+  // Touch ID wird beim Öffnen des gesperrten Popups automatisch angefragt – genau einmal.
+  const bioCalls = () => sent.filter((c) => c === 'unlockBio').length;
+  const locked = (extra) => ({ state: 'locked', email: 'a@b.c', accounts: [], hasPin: false, hasBio: true, bioAuto: true, ...extra });
+  const fail = (m) => (console.error('FEHLGESCHLAGEN: ' + m), process.exit(1));
+  ctx.__st = locked({ bioAuto: false });
+  vm.runInContext('viewLocked(__st)', ctx);
+  if (bioCalls() !== 0) fail('Touch ID trotz ausgeschalteter Einstellung angefragt');
+  ctx.__st = locked({ hasBio: false });
+  vm.runInContext('viewLocked(__st)', ctx);
+  if (bioCalls() !== 0) fail('Touch ID angefragt, obwohl nicht eingerichtet');
+  bioReply = Promise.resolve({ ok: false, error: 'Abgebrochen', code: 'cancelled' });
+  ctx.__st = locked();
+  vm.runInContext('viewLocked(__st)', ctx);
+  await new Promise((r) => setTimeout(r, 20));
+  if (bioCalls() !== 1) fail(`Touch ID ${bioCalls()}x statt 1x angefragt`);
+  if (/Abgebrochen/.test(toastNode.textContent)) fail('Abbruch wird als Fehler angezeigt');
+  vm.runInContext('viewLocked(__st)', ctx); // erneutes Zeichnen (z. B. nach Abbruch) fragt nicht nochmal
+  await new Promise((r) => setTimeout(r, 20));
+  if (bioCalls() !== 1) fail('Touch ID nach Abbruch erneut automatisch angefragt');
+  console.log('touch-id-auto OK');
 })();

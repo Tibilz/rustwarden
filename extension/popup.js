@@ -48,6 +48,7 @@ let filter = 'all';
 let folderFilter = '';
 let timer = null;
 const verified = new Set();
+let bioPrompted = false; // Touch ID nur einmal pro Öffnen des Popups automatisch anfragen
 let showOthers = false; // weitere passende Logins trotz gemerktem Login aufgeklappt
 
 // Safari schließt das Popup, sobald ein Dateidialog aufgeht – Dateiaktionen laufen deshalb in einem Tab.
@@ -464,6 +465,13 @@ function viewLocked(st) {
     ),
   );
   (pin || pw).focus();
+  // Touch ID sofort anfragen (einmal pro Öffnen; nach Abbruch bleiben Knopf, PIN und Passwort).
+  if (st.hasBio && st.bioAuto && !bioPrompted) {
+    bioPrompted = true;
+    send('unlockBio')
+      .then(() => start())
+      .catch((e) => e.code !== 'cancelled' && toast(e.message));
+  }
 }
 
 // ---------- Tresorliste ----------
@@ -1471,6 +1479,7 @@ async function viewSettings() {
       r.hasBio
         ? act('Touch ID deaktivieren', async () => (await send('bioDisable'), again('Touch ID deaktiviert')))
         : act('Touch ID aktivieren', async () => (await send('bioEnable'), again('Touch ID aktiviert'))),
+      r.hasBio && toggle('bioAutoPrompt', 'Beim Öffnen sofort nach Touch ID fragen'),
 
       section('Automatisches Ausfüllen'),
       el('label', {}, 'Standard-URI-Übereinstimmungserkennung'),
